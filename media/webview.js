@@ -13,6 +13,7 @@
     function setStreaming(active) {
         isStreaming = active;
         sendBtn.textContent = active ? '⏹ Stop' : 'Send to Remote Machine';
+        sendBtn.classList.toggle('stop-mode', active);
     }
 
     function escapeHtml(s) {
@@ -69,6 +70,16 @@
     document.getElementById('send-btn').addEventListener('click', () => {
         if (isStreaming) {
             vscode.postMessage({ type: 'stopStream' });
+            setStreaming(false);
+            if (currentAi) {
+                currentAi.classList.remove('pending');
+                if (!currentAiRaw) {
+                    currentAi.innerText = 'Stopped.';
+                    conversation.pop();
+                } else {
+                    currentAi.innerHTML = renderMarkdown(currentAiRaw);
+                }
+            }
             return;
         }
         const text = promptInput.value.trim();
@@ -82,7 +93,7 @@
 
         promptInput.value = '';
         currentAi = document.createElement('div');
-        currentAi.className = 'msg ai';
+        currentAi.className = 'msg ai pending';
         currentAiRaw = '';
         currentAi.innerText = 'Thinking...';
         chatBox.appendChild(currentAi);
@@ -97,6 +108,20 @@
             e.preventDefault();
             document.getElementById('send-btn').click();
         }
+    });
+
+    document.getElementById('clear-btn').addEventListener('click', () => {
+        if (isStreaming) {
+            vscode.postMessage({ type: 'stopStream' });
+            setStreaming(false);
+        }
+        conversation = [];
+        attachments = [];
+        currentAi = null;
+        currentAiRaw = '';
+        chatBox.innerHTML = '';
+        promptInput.value = '';
+        renderAttachments();
     });
 
     document.getElementById('grab-btn').addEventListener('click', () => {
@@ -123,12 +148,14 @@
         const msg = event.data;
         if (msg.type === 'token') {
             currentAiRaw += msg.value;
+            currentAi.classList.remove('pending');
             currentAi.innerHTML = renderMarkdown(currentAiRaw);
             chatBox.scrollTop = chatBox.scrollHeight;
         } else if (msg.type === 'attach') {
             attachments.push({ label: msg.label, value: msg.value });
             renderAttachments();
         } else if (msg.type === 'error') {
+            currentAi.classList.remove('pending');
             currentAi.innerText = 'Error: ' + msg.value;
             conversation.pop();
             setStreaming(false);

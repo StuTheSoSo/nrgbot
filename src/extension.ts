@@ -14,6 +14,8 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 class OllamaViewProvider implements vscode.WebviewViewProvider {
+    private static readonly MAX_ATTACHMENT_CHARS = 50000;
+
     public lastActiveEditor: vscode.TextEditor | undefined;
     private activeRequest: http.ClientRequest | undefined;
     private streamAborted = false;
@@ -23,7 +25,6 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
     public resolveWebviewView(webviewView: vscode.WebviewView) {
         const mediaRoot = vscode.Uri.joinPath(this.extensionUri, 'media');
         webviewView.webview.options = { enableScripts: true, localResourceRoots: [mediaRoot] };
-        webviewView.retainContextWhenHidden = true;
         const scriptUri = webviewView.webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'webview.js'));
         const csp = `default-src 'none'; style-src ${webviewView.webview.cspSource} 'unsafe-inline'; script-src ${webviewView.webview.cspSource};`;
 
@@ -52,17 +53,25 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         .code-block { margin: 0.4em 0; }
         .code-actions { display: flex; gap: 4px; margin-bottom: 2px; }
         .code-actions button { width: auto; margin: 0; padding: 2px 8px; font-size: 0.8em; }
+        .ai.pending { opacity: 0.7; animation: nrgbot-pulse 1.2s ease-in-out infinite; }
+        @keyframes nrgbot-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
         
         /* Fixed bottom tray container formatting profiles */
         .bottom-tray { display: flex; flex-direction: column; width: 100%; }
         textarea { width: 100%; height: 60px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); resize: none; box-sizing: border-box; }
         button { width: 100%; margin-top: 5px; padding: 6px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; cursor: pointer; }
         button:hover { background: var(--vscode-button-hoverBackground); }
+        #send-btn.stop-mode { background: var(--vscode-inputValidation-warningBackground, #b58900); }
         .btn-group { display: flex; gap: 5px; margin-bottom: 5px; }
+        .top-bar { display: flex; justify-content: flex-end; margin-bottom: 5px; }
+        .top-bar button { width: auto; margin: 0; padding: 2px 8px; font-size: 0.8em; }
     </style>
 </head>
 <body>
     <!-- The conversation thread element stays pinned natively on top -->
+    <div class="top-bar">
+        <button id="clear-btn">🗑️ New Chat</button>
+    </div>
     <div id="chat-box"></div>
 
     <!-- All active interface controllers are grouped safely at the bottom margin layout -->
@@ -93,7 +102,10 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                 const ed = this.lastActiveEditor ?? vscode.window.activeTextEditor;
                 if (ed) {
                     const fileName = ed.document.fileName.split(/[\\/]/).pop();
-                    webviewView.webview.postMessage({ type: 'attach', label: `✨ ${fileName} (selection)`, value: ed.document.getText(ed.selection) });
+                    const content = await this._confirmAttachmentSize(ed.document.getText(ed.selection), 'Selection');
+                    if (content !== undefined) {
+                        webviewView.webview.postMessage({ type: 'attach', label: `✨ ${fileName} (selection)`, value: content });
+                    }
                 } else {
                     vscode.window.showWarningMessage('NRGBot: No editor found to grab text from.');
                 }
@@ -101,7 +113,10 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                 const ed = this.lastActiveEditor ?? vscode.window.activeTextEditor;
                 if (ed) {
                     const fileName = ed.document.fileName.split(/[\\/]/).pop();
-                    webviewView.webview.postMessage({ type: 'attach', label: `📄 ${fileName}`, value: ed.document.getText() });
+                    const content = await this._confirmAttachmentSize(ed.document.getText(), 'Full page');
+                    if (content !== undefined) {
+                        webviewView.webview.postMessage({ type: 'attach', label: `📄 ${fileName}`, value: content });
+                    }
                 } else {
                     vscode.window.showWarningMessage('NRGBot: No editor found to grab the page from.');
                 }
@@ -135,6 +150,24 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                 }
             }
         });
+    }
+
+    private async _confirmAttachmentSize(text: string, label: string): Promise<string | undefined> {
+        if (text.length <= OllamaViewProvider.MAX_ATTACHMENT_CHARS) return text;
+
+        const approxTokens = Math.round(text.length / 4);
+        const truncateOption = `Attach Truncated (first ${OllamaViewProvider.MAX_ATTACHMENT_CHARS.toLocaleString()} chars)`;
+        const choice = await vscode.window.showWarningMessage(
+            `${label} is ${text.length.toLocaleString()} characters (~${approxTokens.toLocaleString()} tokens), which may exceed the model's context window.`,
+            'Attach Anyway',
+            truncateOption,
+            'Cancel'
+        );
+        if (!choice || choice === 'Cancel') return undefined;
+        if (choice === truncateOption) {
+            return text.slice(0, OllamaViewProvider.MAX_ATTACHMENT_CHARS) + '\n\n... [truncated]';
+        }
+        return text;
     }
 
     private _streamFromOllama(messages: { role: string; content: string }[], webview: vscode.Webview) {
