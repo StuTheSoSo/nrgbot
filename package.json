@@ -1,0 +1,66 @@
+{
+  "name": "nrgbot",
+  "displayName": "NRGBot",
+  "description": "Private NRG Code Wizard",
+  "version": "0.0.1",
+  "publisher": "Parraid",
+  "icon": "images/icon.png",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ollama-sidebar-container",
+          "title": "ParraidBot",
+          "icon": "images/icon.png"
+        }
+      ]
+    },
+    "views": {
+      "ollama-sidebar-container": [
+        {
+          "type": "webview",
+          "id": "ollama.chatSidebarView",
+          "name": "NRG Wizard",
+          "icon": "$(comment-discussion)"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "NRGBot Configuration",
+      "properties": {
+        "nrgbot.serverUrl": {
+          "type": "string",
+          "default": "http://192.168.3.142:11434",
+          "description": "The base URL of your remote Ollama server."
+        },
+        "nrgbot.modelName": {
+          "type": "string",
+          "default": "qwen2.5-coder:7b",
+          "description": "The exact model name as it appears when running 'ollama list' on your remote machine."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^26.6.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,1 @@
+Private remote Ollama sidebar chat extension.
