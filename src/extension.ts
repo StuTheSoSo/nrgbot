@@ -1,8 +1,9 @@
 import * as vscode from 'vscode';
 import * as http from 'http';
+import * as https from 'https';
 
 export function activate(context: vscode.ExtensionContext) {
-    const provider = new OllamaViewProvider();
+    const provider = new OllamaViewProvider(context.extensionUri);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider('ollama.chatSidebarView', provider),
         vscode.window.onDidChangeActiveTextEditor(editor => {
@@ -14,15 +15,24 @@ export function activate(context: vscode.ExtensionContext) {
 
 class OllamaViewProvider implements vscode.WebviewViewProvider {
     public lastActiveEditor: vscode.TextEditor | undefined;
+    private activeRequest: http.ClientRequest | undefined;
+    private streamAborted = false;
+
+    constructor(private readonly extensionUri: vscode.Uri) {}
 
     public resolveWebviewView(webviewView: vscode.WebviewView) {
-        webviewView.webview.options = { enableScripts: true };
-        
+        const mediaRoot = vscode.Uri.joinPath(this.extensionUri, 'media');
+        webviewView.webview.options = { enableScripts: true, localResourceRoots: [mediaRoot] };
+        webviewView.retainContextWhenHidden = true;
+        const scriptUri = webviewView.webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'webview.js'));
+        const csp = `default-src 'none'; style-src ${webviewView.webview.cspSource} 'unsafe-inline'; script-src ${webviewView.webview.cspSource};`;
+
         webviewView.webview.html = `
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy" content="${csp}">
     <style>
         /* Flexbox configuration pushes all active utility triggers to the very bottom window panel */
         html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; background: var(--vscode-sidebar-background); }
@@ -66,153 +76,19 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         <button id="send-btn">Send to Remote Machine</button>
     </div>
 
-    <script>
-        const vscode = acquireVsCodeApi();
-        const chatBox = document.getElementById('chat-box');
-        const promptInput = document.getElementById('prompt');
-        const attachmentsEl = document.getElementById('attachments');
-        let currentAi = null;
-        let currentAiRaw = '';
-        let attachments = [];
-
-        function escapeHtml(s) {
-            return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        }
-
-        function renderMarkdown(md) {
-            const codeBlocks = [];
-            let text = md.replace(/\`\`\`(\\w*)\\n([\\s\\S]*?)\`\`\`/g, (m, lang, code) => {
-                codeBlocks.push(
-                    '<div class="code-block"><div class="code-actions">' +
-                    '<button class="apply-btn">\ud83d\udcdd Apply to Editor</button>' +
-                    '<button class="copy-btn">\ud83d\udccb Copy</button></div>' +
-                    '<pre><code>' + escapeHtml(code.replace(/\\n$/, '')) + '</code></pre></div>'
-                );
-                return '\\u0000' + (codeBlocks.length - 1) + '\\u0000';
-            });
-
-            text = escapeHtml(text);
-            text = text.replace(/^### (.*)$/gm, '<h3>$1</h3>');
-            text = text.replace(/^## (.*)$/gm, '<h2>$1</h2>');
-            text = text.replace(/^# (.*)$/gm, '<h1>$1</h1>');
-            text = text.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
-            text = text.replace(/\`([^\`]+)\`/g, '<code>$1</code>');
-            text = text.replace(/^\\s*[-*] (.*)$/gm, '<li>$1</li>');
-            text = text.replace(/(<li>[\\s\\S]*?<\\/li>\\n?)+/g, (m) => '<ul>' + m + '</ul>');
-            text = text.split(/\\n{2,}/).map(block => {
-                if (/^<(h\\d|ul|pre)/.test(block.trim()) || block.indexOf('\\u0000') === 0) return block;
-                return '<p>' + block.replace(/\\n/g, '<br>') + '</p>';
-            }).join('');
-
-            text = text.replace(/\\u0000(\\d+)\\u0000/g, (m, i) => codeBlocks[Number(i)]);
-            return text;
-        }
-
-        function stripFences(raw) {
-            const m = raw.trim().match(/^\`\`\`[a-zA-Z]*\\n([\\s\\S]*?)\\n?\`\`\`$/);
-            return m ? m[1] : raw;
-        }
-
-        function renderAttachments() {
-            attachmentsEl.innerHTML = '';
-            attachments.forEach((att, i) => {
-                const chip = document.createElement('span');
-                chip.style.cssText = 'background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);padding:2px 6px;border-radius:10px;font-size:0.85em;';
-                chip.textContent = '\ud83d\udccc ' + att.label + ' \u2715';
-                chip.title = 'Pinned to every message \u2014 click to detach';
-                chip.style.cursor = 'pointer';
-                chip.addEventListener('click', () => { attachments.splice(i, 1); renderAttachments(); });
-                attachmentsEl.appendChild(chip);
-            });
-        }
-
-        document.getElementById('send-btn').addEventListener('click', () => {
-            const text = promptInput.value.trim();
-            if (!text && attachments.length === 0) return;
-            chatBox.innerHTML += '<div class="msg user">' + escapeHtml(text) + '</div>';
-
-            let fullPrompt = text;
-            if (attachments.length) {
-                fullPrompt += '\\n\\n' + attachments.map(a => '\`\`\`\\n' + a.value + '\\n\`\`\`').join('\\n\\n');
-            }
-
-            promptInput.value = '';
-            currentAi = document.createElement('div');
-            currentAi.className = 'msg ai';
-            currentAiRaw = '';
-            currentAi.innerText = 'Thinking...';
-            chatBox.appendChild(currentAi);
-            chatBox.scrollTop = chatBox.scrollHeight;
-            vscode.postMessage({ type: 'sendPrompt', value: fullPrompt });
-        });
-
-        promptInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                document.getElementById('send-btn').click();
-            }
-        });
-
-        document.getElementById('grab-btn').addEventListener('click', () => {
-            attachmentsEl.textContent = 'Grabbing selection...';
-            vscode.postMessage({ type: 'grabText' });
-        });
-        document.getElementById('page-btn').addEventListener('click', () => {
-            attachmentsEl.textContent = 'Grabbing full page...';
-            vscode.postMessage({ type: 'grabPage' });
-        });
-
-        chatBox.addEventListener('click', (e) => {
-            const btn = e.target.closest('.apply-btn, .copy-btn');
-            if (!btn) return;
-            const code = btn.closest('.code-block').querySelector('code').textContent;
-            if (btn.classList.contains('apply-btn')) {
-                vscode.postMessage({ type: 'applyCode', value: code });
-            } else {
-                navigator.clipboard.writeText(code);
-            }
-        });
-
-        window.addEventListener('message', event => {
-            const msg = event.data;
-            console.log('[NRGBot] received message', msg.type, msg);
-            if (msg.type === 'token') {
-                currentAiRaw += msg.value;
-                currentAi.innerHTML = renderMarkdown(currentAiRaw);
-                chatBox.scrollTop = chatBox.scrollHeight;
-            } else if (msg.type === 'attach') {
-                attachments.push({ label: msg.label, value: msg.value });
-                renderAttachments();
-            } else if (msg.type === 'error') {
-                currentAi.innerText = 'Error: ' + msg.value;
-            } else if (msg.type === 'done') {
-                if (currentAi && currentAiRaw) {
-                    const footer = document.createElement('div');
-                    footer.className = 'code-actions';
-                    footer.style.marginTop = '6px';
-                    const applyAllBtn = document.createElement('button');
-                    applyAllBtn.textContent = '\ud83d\udcdd Apply Full Response to Editor';
-                    applyAllBtn.addEventListener('click', () => {
-                        vscode.postMessage({ type: 'applyCode', value: stripFences(currentAiRaw) });
-                    });
-                    const copyAllBtn = document.createElement('button');
-                    copyAllBtn.textContent = '\ud83d\udccb Copy Full Response';
-                    copyAllBtn.addEventListener('click', () => {
-                        navigator.clipboard.writeText(stripFences(currentAiRaw));
-                    });
-                    footer.appendChild(applyAllBtn);
-                    footer.appendChild(copyAllBtn);
-                    currentAi.appendChild(footer);
-                }
-            }
-        });
-    </script>
+    <script src="${scriptUri}"></script>
 </body>
 </html>`;
 
         webviewView.webview.onDidReceiveMessage(async (data) => {
             if (data.type === 'sendPrompt') {
                 this._streamFromOllama(data.value, webviewView.webview);
+            } else if (data.type === 'stopStream') {
+                if (this.activeRequest) {
+                    this.streamAborted = true;
+                    this.activeRequest.destroy();
+                    this.activeRequest = undefined;
+                }
             } else if (data.type === 'grabText') {
                 const ed = this.lastActiveEditor ?? vscode.window.activeTextEditor;
                 if (ed) {
@@ -223,7 +99,6 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                 }
             } else if (data.type === 'grabPage') {
                 const ed = this.lastActiveEditor ?? vscode.window.activeTextEditor;
-                console.log('[NRGBot] grabPage handler, editor:', ed?.document.fileName);
                 if (ed) {
                     const fileName = ed.document.fileName.split(/[\\/]/).pop();
                     webviewView.webview.postMessage({ type: 'attach', label: `📄 ${fileName}`, value: ed.document.getText() });
@@ -262,7 +137,12 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    private _streamFromOllama(promptText: string, webview: vscode.Webview) {
+    private _streamFromOllama(messages: { role: string; content: string }[], webview: vscode.Webview) {
+        if (this.activeRequest) {
+            vscode.window.showWarningMessage('NRGBot: A response is already in progress.');
+            return;
+        }
+
         const config = vscode.workspace.getConfiguration('nrgbot');
         const configuredUrl = config.get<string>('serverUrl') || 'http://192.168.3.142:11434';
         const modelName = config.get<string>('modelName') || 'qwen2.5-coder:7b';
@@ -274,15 +154,18 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             parsedUrl = new URL('http://192.168.3.142:11434');
         }
 
+        const isHttps = parsedUrl.protocol === 'https:';
+        const transport = isHttps ? https : http;
+
         const postData = JSON.stringify({
             model: modelName,
-            messages: [{ role: "user", content: promptText }],
+            messages,
             stream: true
         });
 
         const options = {
             hostname: parsedUrl.hostname,
-            port: parsedUrl.port || 80,
+            port: parsedUrl.port || (isHttps ? 443 : 80),
             path: '/v1/chat/completions',
             method: 'POST',
             headers: { 
@@ -291,7 +174,18 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             }
         };
 
-        const req = http.request(options, (res) => {
+        this.streamAborted = false;
+        const req = transport.request(options, (res) => {
+            if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+                let errorBody = '';
+                res.on('data', chunk => { errorBody += chunk.toString(); });
+                res.on('end', () => {
+                    this.activeRequest = undefined;
+                    webview.postMessage({ type: 'error', value: `HTTP ${res.statusCode}: ${errorBody.slice(0, 300) || res.statusMessage}` });
+                });
+                return;
+            }
+
             let buffer = '';
             res.on('data', (chunk) => {
                 buffer += chunk.toString();
@@ -305,18 +199,26 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                                 const content = json.choices[0].delta.content || '';
                                 if (content) webview.postMessage({ type: 'token', value: content });
                             }
-                        } catch (e) {}
+                        } catch (e) {
+                            console.error('[NRGBot] Failed to parse SSE line:', line, e);
+                        }
                     }
                 }
             });
-            res.on('end', () => { webview.postMessage({ type: 'done' }); });
+            res.on('end', () => {
+                this.activeRequest = undefined;
+                webview.postMessage({ type: 'done' });
+            });
         });
         
         req.on('error', (e) => { 
+            this.activeRequest = undefined;
+            if (this.streamAborted) return;
             webview.postMessage({ type: 'error', value: e.message }); 
             vscode.window.showErrorMessage('NRGBot Connection Failure: ' + e.message);
         });
         
+        this.activeRequest = req;
         req.write(postData);
         req.end();
     }
