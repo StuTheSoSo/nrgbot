@@ -20,6 +20,48 @@
         return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
+    function splitTableRow(line) {
+        let l = line.trim();
+        if (l.startsWith('|')) l = l.slice(1);
+        if (l.endsWith('|')) l = l.slice(0, -1);
+        return l.split('|').map(c => c.trim());
+    }
+
+    function convertTables(text) {
+        const lines = text.split('\n');
+        const out = [];
+        let i = 0;
+        while (i < lines.length) {
+            const line = lines[i];
+            const sep = lines[i + 1];
+            const isSeparator = sep !== undefined && /\|/.test(sep) && /^[\s|:-]+$/.test(sep) && /-/.test(sep);
+            if (/\|/.test(line) && line.trim() !== '' && isSeparator) {
+                const headers = splitTableRow(line);
+                const rows = [];
+                let j = i + 2;
+                while (j < lines.length && /\|/.test(lines[j]) && lines[j].trim() !== '') {
+                    rows.push(splitTableRow(lines[j]));
+                    j++;
+                }
+                let html = '<table class="md-table"><thead><tr>';
+                headers.forEach(h => { html += '<th>' + escapeHtml(h) + '</th>'; });
+                html += '</tr></thead><tbody>';
+                rows.forEach(r => {
+                    html += '<tr>';
+                    headers.forEach((_, idx) => { html += '<td>' + escapeHtml(r[idx] !== undefined ? r[idx] : '') + '</td>'; });
+                    html += '</tr>';
+                });
+                html += '</tbody></table>';
+                out.push(html);
+                i = j;
+            } else {
+                out.push(line);
+                i++;
+            }
+        }
+        return out.join('\n');
+    }
+
     function renderMarkdown(md) {
         const codeBlocks = [];
         let text = md.replace(/```(\w*)\n([\s\S]*?)```/g, (m, lang, code) => {
@@ -32,6 +74,12 @@
             return '\u0000' + (codeBlocks.length - 1) + '\u0000';
         });
 
+        const tableBlocks = [];
+        text = convertTables(text).replace(/<table class="md-table">[\s\S]*?<\/table>/g, (m) => {
+            tableBlocks.push(m);
+            return '\u0001' + (tableBlocks.length - 1) + '\u0001';
+        });
+
         text = escapeHtml(text);
         text = text.replace(/^### (.*)$/gm, '<h3>$1</h3>');
         text = text.replace(/^## (.*)$/gm, '<h2>$1</h2>');
@@ -41,11 +89,12 @@
         text = text.replace(/^\s*[-*] (.*)$/gm, '<li>$1</li>');
         text = text.replace(/(<li>[\s\S]*?<\/li>\n?)+/g, (m) => '<ul>' + m + '</ul>');
         text = text.split(/\n{2,}/).map(block => {
-            if (/^<(h\d|ul|pre)/.test(block.trim()) || block.indexOf('\u0000') === 0) return block;
+            if (/^<(h\d|ul|pre)/.test(block.trim()) || block.indexOf('\u0000') === 0 || block.indexOf('\u0001') === 0) return block;
             return '<p>' + block.replace(/\n/g, '<br>') + '</p>';
         }).join('');
 
         text = text.replace(/\u0000(\d+)\u0000/g, (m, i) => codeBlocks[Number(i)]);
+        text = text.replace(/\u0001(\d+)\u0001/g, (m, i) => tableBlocks[Number(i)]);
         return text;
     }
 

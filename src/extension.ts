@@ -50,6 +50,9 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         .ai pre { background: var(--vscode-textCodeBlock-background); padding: 8px; border-radius: 4px; overflow-x: auto; margin: 0; }
         .ai pre code { padding: 0; background: none; }
         .ai h1, .ai h2, .ai h3 { margin: 0.5em 0 0.3em; }
+        .md-table { border-collapse: collapse; margin: 0.5em 0; font-size: 0.9em; max-width: 100%; display: block; overflow-x: auto; }
+        .md-table th, .md-table td { border: 1px solid var(--vscode-panel-border); padding: 4px 8px; text-align: left; }
+        .md-table th { background: var(--vscode-textBlockQuote-background); font-weight: 600; }
         .code-block { margin: 0.4em 0; }
         .code-actions { display: flex; gap: 4px; margin-bottom: 2px; }
         .code-actions button { width: auto; margin: 0; padding: 2px 8px; font-size: 0.8em; }
