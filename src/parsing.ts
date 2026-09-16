@@ -66,6 +66,59 @@ export function extractLeadingToolCallJson(content: string): LeadingToolCall | n
     };
 }
 
+export interface EmbeddedToolCall {
+    name: string;
+    arguments: string;
+    startIdx: number;
+    endIdx: number;
+}
+
+/**
+ * Finds the first balanced JSON object anywhere in the text that looks like a tool call (has a
+ * string "name"). Recovers a call a model embedded in prose instead of placing at the very start.
+ * Returns null when none is found. Callers should still verify the name is a real tool.
+ */
+export function findToolCallJson(content: string): EmbeddedToolCall | null {
+    for (let start = content.indexOf('{'); start !== -1; start = content.indexOf('{', start + 1)) {
+        let depth = 0;
+        let inString = false;
+        let escape = false;
+        let endIdx = -1;
+        for (let i = start; i < content.length; i++) {
+            const ch = content[i];
+            if (inString) {
+                if (escape) escape = false;
+                else if (ch === '\\') escape = true;
+                else if (ch === '"') inString = false;
+                continue;
+            }
+            if (ch === '"') { inString = true; continue; }
+            if (ch === '{') depth++;
+            else if (ch === '}') {
+                depth--;
+                if (depth === 0) { endIdx = i; break; }
+            }
+        }
+        if (endIdx === -1) continue;
+        try {
+            const parsed = JSON.parse(content.slice(start, endIdx + 1));
+            const name = (parsed as { name?: unknown })?.name;
+            if (typeof name === 'string') {
+                const args = (parsed as { arguments?: unknown })?.arguments;
+                return {
+                    name,
+                    arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}),
+                    startIdx: start,
+                    endIdx
+                };
+            }
+        } catch {
+            // Not valid JSON starting here; try the next '{'.
+        }
+    }
+    return null;
+}
+
 /**
  * Removes a single wrapping code fence from a response, tolerating a language tag on the opening
  * fence and any number of trailing blank lines or duplicated closing fences. Returns the trimmed

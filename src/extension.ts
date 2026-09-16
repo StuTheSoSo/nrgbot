@@ -2,16 +2,88 @@ import * as vscode from 'vscode';
 import * as http from 'http';
 import * as https from 'https';
 import { TOOLS, executeTool, isKnownTool } from './tools';
-import { extractLeadingToolCallJson } from './parsing';
+import { extractLeadingToolCallJson, findToolCallJson } from './parsing';
+import {
+    DEFAULT_KNOWLEDGE_FILE,
+    DEFAULT_CONTEXT_MAX_CHARS,
+    KNOWLEDGE_DOC_TEMPLATE,
+    readKnowledgeDoc,
+    generateProjectMap
+} from './projectContext';
 
 export function activate(context: vscode.ExtensionContext) {
     const previewProvider = new ApplyPreviewProvider();
     const provider = new OllamaViewProvider(context.extensionUri, previewProvider);
+
+    const projectWatcher = vscode.workspace.createFileSystemWatcher('**/*.{sln,csproj,vcxproj}');
+    const invalidate = () => provider.invalidateProjectContext();
+    projectWatcher.onDidCreate(invalidate);
+    projectWatcher.onDidChange(invalidate);
+    projectWatcher.onDidDelete(invalidate);
+
+    // The knowledge doc path is configurable, so the watcher is rebuilt when the setting changes.
+    let knowledgeWatcher: vscode.FileSystemWatcher | undefined;
+    const rebuildKnowledgeWatcher = () => {
+        knowledgeWatcher?.dispose();
+        const folders = vscode.workspace.workspaceFolders;
+        if (!folders || folders.length === 0) {
+            knowledgeWatcher = undefined;
+            return;
+        }
+        const file = vscode.workspace.getConfiguration('nrgbot').get<string>('knowledgeFile') || DEFAULT_KNOWLEDGE_FILE;
+        knowledgeWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folders[0], file));
+        knowledgeWatcher.onDidCreate(invalidate);
+        knowledgeWatcher.onDidChange(invalidate);
+        knowledgeWatcher.onDidDelete(invalidate);
+    };
+    rebuildKnowledgeWatcher();
+
     context.subscriptions.push(
         vscode.workspace.registerTextDocumentContentProvider(ApplyPreviewProvider.scheme, previewProvider),
         vscode.window.registerWebviewViewProvider('ollama.chatSidebarView', provider),
         vscode.window.onDidChangeActiveTextEditor(editor => {
             if (editor) provider.lastActiveEditor = editor;
+        }),
+        vscode.window.tabGroups.onDidChangeTabs(() => provider.syncPendingEditWithOpenTabs()),
+        projectWatcher,
+        { dispose: () => knowledgeWatcher?.dispose() },
+        vscode.workspace.onDidChangeConfiguration(e => {
+            if (!e.affectsConfiguration('nrgbot')) return;
+            invalidate();
+            if (e.affectsConfiguration('nrgbot.knowledgeFile')) rebuildKnowledgeWatcher();
+        }),
+        vscode.workspace.onDidChangeWorkspaceFolders(() => {
+            invalidate();
+            rebuildKnowledgeWatcher();
+        }),
+        vscode.commands.registerCommand('nrgbot.refreshProjectContext', async () => {
+            provider.invalidateProjectContext();
+            await provider.warmProjectContext();
+            vscode.window.showInformationMessage('NRGBot: project context refreshed.');
+        }),
+        vscode.commands.registerCommand('nrgbot.applyProposedEdit', () => provider.applyProposedEdit()),
+        vscode.commands.registerCommand('nrgbot.discardProposedEdit', () => provider.discardProposedEdit()),
+        vscode.commands.registerCommand('nrgbot.generateKnowledgeDoc', async () => {
+            const folders = vscode.workspace.workspaceFolders;
+            if (!folders || folders.length === 0) {
+                vscode.window.showWarningMessage('NRGBot: open a workspace folder first.');
+                return;
+            }
+            const file = vscode.workspace.getConfiguration('nrgbot').get<string>('knowledgeFile') || DEFAULT_KNOWLEDGE_FILE;
+            const uri = vscode.Uri.joinPath(folders[0].uri, file);
+            let existed = true;
+            try {
+                await vscode.workspace.fs.stat(uri);
+            } catch {
+                existed = false;
+                await vscode.workspace.fs.writeFile(uri, Buffer.from(KNOWLEDGE_DOC_TEMPLATE, 'utf8'));
+                provider.invalidateProjectContext();
+            }
+            const doc = await vscode.workspace.openTextDocument(uri);
+            await vscode.window.showTextDocument(doc);
+            if (existed) {
+                vscode.window.showInformationMessage(`NRGBot: ${file} already exists; opened it.`);
+            }
         })
     );
     if (vscode.window.activeTextEditor) provider.lastActiveEditor = vscode.window.activeTextEditor;
@@ -43,11 +115,100 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
     public lastActiveEditor: vscode.TextEditor | undefined;
     private activeRequest: http.ClientRequest | undefined;
     private streamAborted = false;
+    private projectContext: { knowledge: string; map: string } | undefined;
+    private pendingEdit: { edit: vscode.WorkspaceEdit; previewUri: vscode.Uri } | undefined;
 
     constructor(
         private readonly extensionUri: vscode.Uri,
         private readonly previewProvider: ApplyPreviewProvider
     ) {}
+
+    /** Apply the change currently shown in the proposed-diff preview (title-bar Apply button). */
+    public async applyProposedEdit(): Promise<void> {
+        const pending = this.pendingEdit;
+        if (!pending) return;
+        await vscode.workspace.applyEdit(pending.edit);
+        await this.clearPendingEdit();
+    }
+
+    /** Discard the proposed change without applying it (title-bar Discard button). */
+    public async discardProposedEdit(): Promise<void> {
+        if (!this.pendingEdit) return;
+        await this.clearPendingEdit();
+    }
+
+    private async clearPendingEdit(): Promise<void> {
+        const pending = this.pendingEdit;
+        this.pendingEdit = undefined;
+        await vscode.commands.executeCommand('setContext', 'nrgbot.hasPendingEdit', false);
+        if (!pending) return;
+        // Close the proposed-diff tab so the accept/deny affordance disappears once resolved.
+        for (const group of vscode.window.tabGroups.all) {
+            for (const tab of group.tabs) {
+                const input = tab.input as vscode.TabInputTextDiff | undefined;
+                if (input?.modified?.toString() === pending.previewUri.toString()) {
+                    await vscode.window.tabGroups.close(tab);
+                }
+            }
+        }
+    }
+
+    /** If the proposed-diff tab was closed without Apply/Discard, disarm the buttons. */
+    public async syncPendingEditWithOpenTabs(): Promise<void> {
+        const pending = this.pendingEdit;
+        if (!pending) return;
+        const stillOpen = vscode.window.tabGroups.all.some(group =>
+            group.tabs.some(tab => {
+                const input = tab.input as vscode.TabInputTextDiff | undefined;
+                return input?.modified?.toString() === pending.previewUri.toString();
+            }));
+        if (!stillOpen) {
+            this.pendingEdit = undefined;
+            await vscode.commands.executeCommand('setContext', 'nrgbot.hasPendingEdit', false);
+        }
+    }
+
+    /** Drop the cached project context so the next request regenerates it. */
+    public invalidateProjectContext(): void {
+        this.projectContext = undefined;
+    }
+
+    /** Eagerly (re)build the cached project context, e.g. from the refresh command. */
+    public async warmProjectContext(): Promise<void> {
+        await this.getProjectContext();
+    }
+
+    private async getProjectContext(): Promise<{ knowledge: string; map: string }> {
+        if (this.projectContext) return this.projectContext;
+        const config = vscode.workspace.getConfiguration('nrgbot');
+        const knowledgeFile = config.get<string>('knowledgeFile') || DEFAULT_KNOWLEDGE_FILE;
+        const includeMap = config.get<boolean>('includeProjectMap') !== false;
+        const maxChars = config.get<number>('projectContextMaxChars') ?? DEFAULT_CONTEXT_MAX_CHARS;
+        const knowledge = await readKnowledgeDoc(knowledgeFile, maxChars);
+        const map = includeMap ? await generateProjectMap(maxChars) : '';
+        this.projectContext = { knowledge, map };
+        return this.projectContext;
+    }
+
+    private static readonly BASE_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message may already include attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>". That attached content IS the file the user is referring to; treat it as fully available and answer from it directly. Never call read_file or list_directory for a file whose content is already attached, and never claim an attached file does not exist. Do not echo or quote the complete attached file unless the user explicitly asks for it. You have read-only tools (read_file, list_directory, search_text, list_files) that give you direct access to every file in the workspace. When a question needs file contents, sizes, line counts, or the largest files, CALL THE TOOLS to gather the facts instead of asking the user to attach files or emitting placeholder values. Use list_files (with sortBy and limit) for questions about file sizes, line counts, or largest files. Never guess or fabricate file data. Never write JSON tool calls in your response. Only call tools supplied in this request; never invent a tool such as analyze_code_quality. Analyze attached code directly in your normal response. After a tool returns its result, write your final answer as plain English markdown prose. Never output JSON, JSON-RPC, an "error"/"result"/"jsonrpc" object, or any protocol message as your answer; the tool result is the real file content, so use it to answer the question.';
+
+    // Used when the message already carries an attached file: no tools are offered, so the prompt
+    // must not mention them or a weak model will still write a tool call as text and stall.
+    private static readonly ATTACHMENT_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message includes attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>". That attached content IS the file the user is asking about and is fully available to you. Analyze it directly and answer in plain English markdown prose. You have NO tools available: do not call, request, or mention any tool (read_file, list_files, etc.), do not ask the user to run or confirm anything, and do not ask for the file or claim you lack access. Never output JSON, a tool call, an "error"/"result"/"jsonrpc" object, or any protocol message \u2014 just write your analysis. Do not echo or quote the entire file unless the user explicitly asks.';
+
+    private buildSystemPrompt(context: { knowledge: string; map: string }, hasAttachment = false): string {
+        if (hasAttachment) {
+            return OllamaViewProvider.ATTACHMENT_SYSTEM_PROMPT;
+        }
+        const parts = [OllamaViewProvider.BASE_SYSTEM_PROMPT];
+        if (context.knowledge) {
+            parts.push('## Project knowledge (Starfish)\n' + context.knowledge);
+        }
+        if (context.map) {
+            parts.push('## Solution map\n' + context.map);
+        }
+        return parts.join('\n\n');
+    }
 
     public resolveWebviewView(webviewView: vscode.WebviewView) {
         const mediaRoot = vscode.Uri.joinPath(this.extensionUri, 'media');
@@ -384,18 +545,14 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             'vscode.diff',
             targetUri,
             previewUri,
-            `${fileName} \u2194 Proposed (${choice})`,
+            `${fileName} \u2194 Proposed (${choice})  \u2013 use \u2713 Apply / \u2715 Discard in the title bar`,
             { preview: true }
         );
 
-        const confirm = await vscode.window.showInformationMessage(
-            `Review the diff, then apply "${choice}" to ${fileName}?`,
-            'Apply',
-            'Cancel'
-        );
-        if (confirm === 'Apply') {
-            await vscode.workspace.applyEdit(edit);
-        }
+        // Arm the title-bar Apply/Discard buttons (see contributes.menus). Replaces an easy-to-miss
+        // corner toast so accepting or rejecting the change is unmistakable in the diff itself.
+        this.pendingEdit = { edit, previewUri };
+        await vscode.commands.executeCommand('setContext', 'nrgbot.hasPendingEdit', true);
     }
 
     private async _confirmAttachmentSize(text: string, label: string): Promise<string | undefined> {
@@ -418,10 +575,48 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
 
     private static readonly MAX_AGENT_ITERATIONS = 6;
 
+    /** Tells that the model guessed at file data instead of calling a tool to fetch it. */
+    private _looksLikeMissingFileAccess(text: string): boolean {
+        if (!text) return false;
+        return /\b(hypothetical|placeholder|rough estimate)\b/i.test(text)
+            || /(attach|provide|share|paste)\b[^.]{0,50}\b(file|files|code|contents?)\b/i.test(text)
+            || /\bI (do not|don'?t) have (direct )?(access|visibility)\b/i.test(text)
+            || /\bwithout (access to|seeing|the actual)\b/i.test(text);
+    }
+
+    // Weak models sometimes reply with a bare JSON blob (an echoed call, a fake {"error":...} or
+    // a hallucinated jsonrpc envelope) instead of a real answer. Detect "the whole message is JSON".
+    private _looksLikeBareJsonAnswer(text: string): boolean {
+        if (!text) return false;
+        let s = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+        if (!s.startsWith('{') && !s.startsWith('[')) return false;
+        const open = s[0];
+        const close = open === '{' ? '}' : ']';
+        let depth = 0, inString = false, escape = false, endIdx = -1;
+        for (let i = 0; i < s.length; i++) {
+            const ch = s[i];
+            if (inString) {
+                if (escape) escape = false;
+                else if (ch === '\\') escape = true;
+                else if (ch === '"') inString = false;
+                continue;
+            }
+            if (ch === '"') { inString = true; continue; }
+            if (ch === open) depth++;
+            else if (ch === close) { depth--; if (depth === 0) { endIdx = i; break; } }
+        }
+        if (endIdx === -1) return false;
+        try { JSON.parse(s.slice(0, endIdx + 1)); } catch { return false; }
+        // Bare JSON only if little/no prose follows the object.
+        return s.slice(endIdx + 1).trim().length <= 40;
+    }
+
     private async _streamFromOllama(
         messages: { role: string; content: string | null; tool_calls?: unknown[]; tool_call_id?: string }[],
         webview: vscode.Webview,
-        depth = 0
+        depth = 0,
+        retried = false,
+        seenToolCalls: Set<string> = new Set()
     ): Promise<void> {
         if (depth >= OllamaViewProvider.MAX_AGENT_ITERATIONS) {
             webview.postMessage({ type: 'error', value: 'Stopped: too many tool-call iterations.' });
@@ -430,14 +625,41 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
 
         const config = vscode.workspace.getConfiguration('nrgbot');
         const toolsEnabled = config.get<boolean>('enableTools') ?? true;
+        const projectContext = await this.getProjectContext();
 
-        const result = await this._postChatCompletion(messages, webview, toolsEnabled);
+        const result = await this._postChatCompletion(messages, webview, toolsEnabled, projectContext);
         if (!result) return; // error or abort already reported
 
         if (result.toolCalls.length === 0) {
+            if (toolsEnabled && !retried && this._looksLikeMissingFileAccess(result.content)) {
+                webview.postMessage({ type: 'retry' });
+                const reminder = 'You answered without calling any tool. You have direct read-only access to the workspace: use list_files (with sortBy and limit) for file sizes, line counts, or the largest files, and read_file to inspect a file. Call the appropriate tool now and answer from the real results. Do not ask the user to attach files, and never use hypothetical or placeholder values.';
+                const nudged = [
+                    ...messages,
+                    { role: 'assistant', content: result.content || null },
+                    { role: 'user', content: reminder }
+                ];
+                await this._streamFromOllama(nudged, webview, depth + 1, true, seenToolCalls);
+                return;
+            }
+            if (!retried && this._looksLikeBareJsonAnswer(result.content)) {
+                webview.postMessage({ type: 'retry' });
+                const reminder = 'Your previous reply was raw JSON, which is not a valid answer. Any file content you needed has already been provided. Answer the user\'s question now in plain English markdown prose. Do NOT output JSON, an "error" object, a "jsonrpc"/"result" object, or any protocol message.';
+                const nudged = [
+                    ...messages,
+                    { role: 'assistant', content: result.content || null },
+                    { role: 'user', content: reminder }
+                ];
+                await this._streamFromOllama(nudged, webview, depth + 1, true, seenToolCalls);
+                return;
+            }
             webview.postMessage({ type: 'done' });
             return;
         }
+
+        // This turn produced tool calls; any text it streamed is just the model echoing its own
+        // call as JSON. Drop that draft (the tool-log badges stay) so the real answer replaces it.
+        webview.postMessage({ type: 'clearDraft' });
 
         const nextMessages = [...messages, {
             role: 'assistant',
@@ -450,6 +672,18 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         }];
 
         for (const tc of result.toolCalls) {
+            const signature = `${tc.name}(${(tc.arguments || '').trim()})`;
+            if (seenToolCalls.has(signature)) {
+                // Same call already ran this turn; refuse to repeat it and steer the model forward.
+                nextMessages.push({
+                    role: 'tool',
+                    tool_call_id: tc.id,
+                    content: `You already called ${tc.name} with these exact arguments and received its result earlier. Do not call it again. Answer the user now using that result, or call a different tool (to read one file's contents use read_file with its "path").`
+                });
+                continue;
+            }
+            seenToolCalls.add(signature);
+
             let args: Record<string, unknown> = {};
             try {
                 args = tc.arguments ? JSON.parse(tc.arguments) : {};
@@ -465,13 +699,14 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             nextMessages.push({ role: 'tool', tool_call_id: tc.id, content: toolResult });
         }
 
-        await this._streamFromOllama(nextMessages, webview, depth + 1);
+        await this._streamFromOllama(nextMessages, webview, depth + 1, false, seenToolCalls);
     }
 
     private _postChatCompletion(
         messages: { role: string; content: string | null; tool_calls?: unknown[]; tool_call_id?: string }[],
         webview: vscode.Webview,
-        toolsEnabled: boolean
+        toolsEnabled: boolean,
+        projectContext: { knowledge: string; map: string }
     ): Promise<{ content: string; toolCalls: { id: string; name: string; arguments: string }[] } | null> {
         return new Promise((resolve) => {
             if (this.activeRequest) {
@@ -482,7 +717,7 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
 
             const config = vscode.workspace.getConfiguration('nrgbot');
             const configuredUrl = config.get<string>('serverUrl') || 'http://192.168.3.142:11434';
-            const modelName = config.get<string>('modelName') || 'qwen2.5-coder:7b';
+            const modelName = config.get<string>('modelName') || 'qwen2.5-coder:14b';
 
             let parsedUrl: URL;
             try {
@@ -494,15 +729,20 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             const isHttps = parsedUrl.protocol === 'https:';
             const transport = isHttps ? https : http;
 
+            const hasAttachment = messages.some(m =>
+                m.role === 'user' && typeof m.content === 'string' && m.content.includes('Attached file:'));
             const systemMessage = {
                 role: 'system',
-                content: 'You are a coding assistant inside VS Code. The user\'s message may already include attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>". That attached content IS the file the user is referring to; treat it as fully available and answer from it directly. Never call read_file or list_directory for a file whose content is already attached, and never claim an attached file does not exist. Do not echo or quote the complete attached file unless the user explicitly asks for it. Never write JSON tool calls in your response. Only call tools supplied in this request; never invent a tool such as analyze_code_quality. Analyze attached code directly in your normal response.'
+                // A pasted file is the real subject; injecting Starfish knowledge/map here just distracts a small model.
+                content: this.buildSystemPrompt(projectContext, hasAttachment)
             };
             const postData = JSON.stringify({
                 model: modelName,
                 messages: [systemMessage, ...messages],
                 stream: true,
-                ...(toolsEnabled ? { tools: TOOLS } : {})
+                // With a file attached the answer is in the prompt; offering tools just tempts a small
+                // model into emitting tool-call JSON instead of evaluating the attachment.
+                ...(toolsEnabled && !hasAttachment ? { tools: TOOLS } : {})
             });
 
             const options = {
@@ -611,11 +851,41 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                     // instead of using the tool_calls delta, or echo the call back before/alongside their answer.
                     const leading = extractLeadingToolCallJson(content);
                     if (leading) {
-                        if (toolCalls.length === 0 && leading.rest.trim() === '') {
+                        // A leading tool-call JSON is a real (mis-formatted) call even when the model tacks on a
+                        // short hallucinated "result" sentence after it. Only keep it as prose if a substantial
+                        // answer or a code block follows (i.e. the JSON was a genuine example, not an actual call).
+                        const restIsNoise = leading.rest.trim() === ''
+                            || (isKnownTool(leading.name)
+                                && !leading.rest.includes('```')
+                                && leading.rest.trim().length <= 200);
+                        if (toolCalls.length === 0 && restIsNoise) {
                             toolCalls = [{ id: `fallback-${Date.now()}`, name: leading.name, arguments: leading.arguments }];
                             content = '';
+                            // The raw JSON already streamed to the view; clear it so the real result replaces it.
+                            webview.postMessage({ type: 'retry' });
                         } else {
                             content = leading.rest;
+                        }
+                    }
+                    // Weaker models sometimes bury the tool-call JSON inside prose rather than leading with it.
+                    // Only treat it as a real call when the JSON is essentially the whole message; otherwise it is
+                    // a genuine answer that merely contains JSON (a code sample or an echoed example), and hijacking
+                    // it would wipe the answer and restart the turn in a loop.
+                    if (toolCalls.length === 0) {
+                        const embedded = findToolCallJson(content);
+                        if (embedded && isKnownTool(embedded.name)) {
+                            const before = content.slice(0, embedded.startIdx);
+                            const after = content.slice(embedded.endIdx + 1);
+                            const proseAround = (before + after)
+                                .replace(/<\/?tool_call>/gi, '')
+                                .replace(/```(?:json)?/gi, '')
+                                .trim();
+                            if (proseAround.length <= 40) {
+                                toolCalls = [{ id: `fallback-${Date.now()}`, name: embedded.name, arguments: embedded.arguments }];
+                                content = '';
+                                // The raw JSON already streamed to the view; clear it so the real result replaces it.
+                                webview.postMessage({ type: 'retry' });
+                            }
                         }
                     }
                     finish({ content, toolCalls });

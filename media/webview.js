@@ -215,7 +215,8 @@
         copyBtn.className = 'btn';
         copyBtn.innerHTML = '<i class="codicon codicon-copy"></i> Copy';
         copyBtn.addEventListener('click', () => {
-            navigator.clipboard.writeText(raw);
+            // Match what Apply would write: copy the lone code block, else the whole message.
+            navigator.clipboard.writeText(codeBlocks.length === 1 ? codeBlocks[0] : raw);
         });
         footer.appendChild(copyBtn);
         return footer;
@@ -385,6 +386,19 @@
             label.textContent = msg.name + '(' + (msg.args || '') + ')';
             note.appendChild(label);
             currentToolLog.appendChild(note);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        } else if (msg.type === 'retry') {
+            // The model guessed instead of calling a tool; discard the draft and stream the retry fresh.
+            currentAiRaw = '';
+            if (currentToolLog) currentToolLog.innerHTML = '';
+            if (currentAiContent) currentAiContent.innerHTML = typingHtml();
+            if (currentAi) currentAi.classList.add('pending');
+            chatBox.scrollTop = chatBox.scrollHeight;
+        } else if (msg.type === 'clearDraft') {
+            // The turn produced real tool calls; drop the echoed JSON text but keep the tool-log badges.
+            currentAiRaw = '';
+            if (currentAiContent) currentAiContent.innerHTML = typingHtml();
+            if (currentAi) currentAi.classList.add('pending');
             chatBox.scrollTop = chatBox.scrollHeight;
         } else if (msg.type === 'attach') {
             attachments.push({ label: msg.label, fileName: msg.fileName, value: msg.value });

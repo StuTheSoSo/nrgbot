@@ -1,5 +1,5 @@
 import * as assert from 'assert';
-import { extractLeadingToolCallJson, stripFences, getCodeBlocks } from '../parsing';
+import { extractLeadingToolCallJson, findToolCallJson, stripFences, getCodeBlocks } from '../parsing';
 
 suite('parsing: extractLeadingToolCallJson', () => {
     test('bare JSON tool call followed by prose', () => {
@@ -64,6 +64,32 @@ suite('parsing: extractLeadingToolCallJson', () => {
 
     test('object without a string name returns null', () => {
         assert.strictEqual(extractLeadingToolCallJson('{"arguments":{"path":"a"}}'), null);
+    });
+});
+
+suite('parsing: findToolCallJson', () => {
+    test('recovers a tool call embedded after prose', () => {
+        const input = 'Sure, let me read it.\n{"name": "read_file", "arguments": {"path": "a/b/c.cs"}}';
+        const r = findToolCallJson(input);
+        assert.ok(r);
+        assert.strictEqual(r!.name, 'read_file');
+        assert.strictEqual(r!.arguments, '{"path":"a/b/c.cs"}');
+    });
+
+    test('recovers a leading tool call with a long nested path', () => {
+        const input = '{"name": "read_file", "arguments": {"path": "Gateway.Libraries/RadioProgrammer/CollinsKY100/ModeSelectionParser.cs"}}';
+        const r = findToolCallJson(input);
+        assert.ok(r);
+        assert.strictEqual(r!.name, 'read_file');
+        assert.strictEqual(input.slice(r!.startIdx, r!.endIdx + 1), input);
+    });
+
+    test('skips non-tool JSON and returns null when no name is present', () => {
+        assert.strictEqual(findToolCallJson('config: {"path": "a", "size": 3}'), null);
+    });
+
+    test('plain prose returns null', () => {
+        assert.strictEqual(findToolCallJson('Just a normal answer with no JSON.'), null);
     });
 });
 

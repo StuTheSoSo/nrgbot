@@ -34,6 +34,44 @@
         }
       ]
     },
+    "commands": [
+      {
+        "command": "nrgbot.refreshProjectContext",
+        "title": "Refresh Project Context",
+        "category": "NRGBot"
+      },
+      {
+        "command": "nrgbot.generateKnowledgeDoc",
+        "title": "Generate Knowledge Doc",
+        "category": "NRGBot"
+      },
+      {
+        "command": "nrgbot.applyProposedEdit",
+        "title": "Apply Change",
+        "category": "NRGBot",
+        "icon": "$(check)"
+      },
+      {
+        "command": "nrgbot.discardProposedEdit",
+        "title": "Discard Change",
+        "category": "NRGBot",
+        "icon": "$(close)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "nrgbot.applyProposedEdit",
+          "when": "nrgbot.hasPendingEdit && resourceScheme == 'nrgbot-preview'",
+          "group": "navigation@1"
+        },
+        {
+          "command": "nrgbot.discardProposedEdit",
+          "when": "nrgbot.hasPendingEdit && resourceScheme == 'nrgbot-preview'",
+          "group": "navigation@2"
+        }
+      ]
+    },
     "configuration": {
       "title": "NRGBot Configuration",
       "properties": {
@@ -44,13 +82,28 @@
         },
         "nrgbot.modelName": {
           "type": "string",
-          "default": "qwen2.5-coder:7b",
-          "description": "The exact model name as it appears when running 'ollama list' on your remote machine."
+          "default": "qwen2.5-coder:14b",
+          "description": "The exact model name as it appears when running 'ollama list' on your remote machine. A 14b+ tool-calling model is strongly recommended; 7b models often hallucinate tool results."
         },
         "nrgbot.enableTools": {
           "type": "boolean",
           "default": true,
           "description": "Allow the model to call read-only workspace tools (read file, list directory, search text). Requires a tool-calling-capable model."
+        },
+        "nrgbot.knowledgeFile": {
+          "type": "string",
+          "default": ".nrgbot/knowledge.md",
+          "description": "Workspace-relative path to a hand-authored knowledge doc about this solution. Its contents are injected into the model's system prompt when present."
+        },
+        "nrgbot.includeProjectMap": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically inject a compact map of the open solution (.sln projects, languages, target frameworks) into the model's system prompt."
+        },
+        "nrgbot.projectContextMaxChars": {
+          "type": "number",
+          "default": 6000,
+          "description": "Maximum characters of injected project context (knowledge doc and solution map each capped to this) to protect the model's context window."
         }
       }
     }
