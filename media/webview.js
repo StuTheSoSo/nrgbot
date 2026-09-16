@@ -404,6 +404,9 @@
             attachments.push({ label: msg.label, fileName: msg.fileName, value: msg.value });
             renderAttachments();
             saveState();
+        } else if (msg.type === 'focusPrompt') {
+            removeWelcome();
+            promptInput.focus();
         } else if (msg.type === 'error') {
             if (currentAi) currentAi.classList.remove('pending');
             if (currentAiContent) currentAiContent.innerText = 'Error: ' + msg.value;

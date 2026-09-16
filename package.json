@@ -19,7 +19,7 @@
         {
           "id": "ollama-sidebar-container",
           "title": "ParraidBot",
-          "icon": "images/icon.png"
+          "icon": "images/robot.svg"
         }
       ]
     },
@@ -46,6 +46,11 @@
         "category": "NRGBot"
       },
       {
+        "command": "nrgbot.generateRefactorRules",
+        "title": "Generate Refactoring Rules",
+        "category": "NRGBot"
+      },
+      {
         "command": "nrgbot.applyProposedEdit",
         "title": "Apply Change",
         "category": "NRGBot",
@@ -56,9 +61,46 @@
         "title": "Discard Change",
         "category": "NRGBot",
         "icon": "$(close)"
+      },
+      {
+        "command": "nrgbot.askAboutSelection",
+        "title": "Ask about Selection",
+        "category": "NRGBot"
+      },
+      {
+        "command": "nrgbot.attachSelection",
+        "title": "Add Selection to Chat",
+        "category": "NRGBot"
+      },
+      {
+        "command": "nrgbot.attachFile",
+        "title": "Add File to Chat",
+        "category": "NRGBot"
       }
     ],
     "menus": {
+      "editor/context": [
+        {
+          "submenu": "nrgbot.editorSubmenu",
+          "group": "1_modification"
+        }
+      ],
+      "nrgbot.editorSubmenu": [
+        {
+          "command": "nrgbot.askAboutSelection",
+          "when": "editorHasSelection",
+          "group": "1_ask@1"
+        },
+        {
+          "command": "nrgbot.attachSelection",
+          "when": "editorHasSelection",
+          "group": "1_ask@2"
+        },
+        {
+          "command": "nrgbot.attachFile",
+          "group": "2_attach@1"
+        }
+      ],
       "editor/title": [
         {
           "command": "nrgbot.applyProposedEdit",
@@ -72,6 +114,12 @@
         }
       ]
     },
+    "submenus": [
+      {
+        "id": "nrgbot.editorSubmenu",
+        "label": "NRGBot"
+      }
+    ],
     "configuration": {
       "title": "NRGBot Configuration",
       "properties": {
@@ -95,6 +143,11 @@
           "default": ".nrgbot/knowledge.md",
           "description": "Workspace-relative path to a hand-authored knowledge doc about this solution. Its contents are injected into the model's system prompt when present."
         },
+        "nrgbot.refactorRulesFile": {
+          "type": "string",
+          "default": ".nrgbot/refactor-rules.md",
+          "description": "Workspace-relative path to a hand-authored rules doc. Its contents are appended to the model's prompt on every attached-file coding request so refactors follow your rules."
+        },
         "nrgbot.includeProjectMap": {
           "type": "boolean",
           "default": true,
@@ -102,8 +155,15 @@
         },
         "nrgbot.projectContextMaxChars": {
           "type": "number",
-          "default": 6000,
+          "default": 9000,
           "description": "Maximum characters of injected project context (knowledge doc and solution map each capped to this) to protect the model's context window."
+        },
+        "nrgbot.temperature": {
+          "type": "number",
+          "default": 0.2,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Sampling temperature sent to the model. Low values (0.1–0.3) keep answers factual and grounded in the knowledge doc; higher values are more creative but hallucinate more."
         }
       }
     }

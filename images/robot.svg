@@ -1,0 +1,10 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path fill="currentColor" d="M11 1.5a1 1 0 1 1 2 0v1.05A1.5 1.5 0 0 1 14 4v.55A5 5 0 0 1 18 9.5v.55c.58.2 1 .76 1 1.42v2.06c0 .66-.42 1.22-1 1.42v.13A5 5 0 0 1 13 20h-2a5 5 0 0 1-5-4.9v-.14c-.58-.2-1-.76-1-1.42v-2.06c0-.66.42-1.22 1-1.42V9.5a5 5 0 0 1 4-4.9V4a1.5 1.5 0 0 1 1-1.45V1.5ZM11 4.5A3.5 3.5 0 0 0 7.5 8v7.1A3.5 3.5 0 0 0 11 18.5h2a3.5 3.5 0 0 0 3.5-3.4V8A3.5 3.5 0 0 0 13 4.5h-2Z"/>
+  <circle cx="9.5" cy="11" r="1.6" fill="currentColor"/>
+  <circle cx="14.5" cy="11" r="1.6" fill="currentColor"/>
+  <rect x="9" y="14.4" width="1" height="2.1" rx="0.5" fill="currentColor"/>
+  <rect x="11.5" y="14.4" width="1" height="2.1" rx="0.5" fill="currentColor"/>
+  <rect x="14" y="14.4" width="1" height="2.1" rx="0.5" fill="currentColor"/>
+  <rect x="3" y="10" width="1.6" height="4" rx="0.8" fill="currentColor"/>
+  <rect x="19.4" y="10" width="1.6" height="4" rx="0.8" fill="currentColor"/>
+</svg>

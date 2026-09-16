@@ -5,11 +5,19 @@ import { TOOLS, executeTool, isKnownTool } from './tools';
 import { extractLeadingToolCallJson, findToolCallJson } from './parsing';
 import {
     DEFAULT_KNOWLEDGE_FILE,
+    DEFAULT_RULES_FILE,
     DEFAULT_CONTEXT_MAX_CHARS,
     KNOWLEDGE_DOC_TEMPLATE,
+    REFACTOR_RULES_TEMPLATE,
     readKnowledgeDoc,
     generateProjectMap
 } from './projectContext';
+
+interface ProjectContext {
+    knowledge: string;
+    map: string;
+    rules: string;
+}
 
 export function activate(context: vscode.ExtensionContext) {
     const previewProvider = new ApplyPreviewProvider();
@@ -21,22 +29,28 @@ export function activate(context: vscode.ExtensionContext) {
     projectWatcher.onDidChange(invalidate);
     projectWatcher.onDidDelete(invalidate);
 
-    // The knowledge doc path is configurable, so the watcher is rebuilt when the setting changes.
-    let knowledgeWatcher: vscode.FileSystemWatcher | undefined;
-    const rebuildKnowledgeWatcher = () => {
-        knowledgeWatcher?.dispose();
+    // The knowledge and rules doc paths are configurable, so their watchers are rebuilt when a
+    // setting changes.
+    let docWatchers: vscode.FileSystemWatcher[] = [];
+    const rebuildDocWatchers = () => {
+        docWatchers.forEach(w => w.dispose());
+        docWatchers = [];
         const folders = vscode.workspace.workspaceFolders;
-        if (!folders || folders.length === 0) {
-            knowledgeWatcher = undefined;
-            return;
+        if (!folders || folders.length === 0) return;
+        const cfg = vscode.workspace.getConfiguration('nrgbot');
+        const files = [
+            cfg.get<string>('knowledgeFile') || DEFAULT_KNOWLEDGE_FILE,
+            cfg.get<string>('refactorRulesFile') || DEFAULT_RULES_FILE
+        ];
+        for (const file of files) {
+            const w = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folders[0], file));
+            w.onDidCreate(invalidate);
+            w.onDidChange(invalidate);
+            w.onDidDelete(invalidate);
+            docWatchers.push(w);
         }
-        const file = vscode.workspace.getConfiguration('nrgbot').get<string>('knowledgeFile') || DEFAULT_KNOWLEDGE_FILE;
-        knowledgeWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folders[0], file));
-        knowledgeWatcher.onDidCreate(invalidate);
-        knowledgeWatcher.onDidChange(invalidate);
-        knowledgeWatcher.onDidDelete(invalidate);
     };
-    rebuildKnowledgeWatcher();
+    rebuildDocWatchers();
 
     context.subscriptions.push(
         vscode.workspace.registerTextDocumentContentProvider(ApplyPreviewProvider.scheme, previewProvider),
@@ -46,23 +60,26 @@ export function activate(context: vscode.ExtensionContext) {
         }),
         vscode.window.tabGroups.onDidChangeTabs(() => provider.syncPendingEditWithOpenTabs()),
         projectWatcher,
-        { dispose: () => knowledgeWatcher?.dispose() },
+        { dispose: () => docWatchers.forEach(w => w.dispose()) },
         vscode.workspace.onDidChangeConfiguration(e => {
             if (!e.affectsConfiguration('nrgbot')) return;
             invalidate();
-            if (e.affectsConfiguration('nrgbot.knowledgeFile')) rebuildKnowledgeWatcher();
+            if (e.affectsConfiguration('nrgbot.knowledgeFile') || e.affectsConfiguration('nrgbot.refactorRulesFile')) rebuildDocWatchers();
         }),
         vscode.workspace.onDidChangeWorkspaceFolders(() => {
             invalidate();
-            rebuildKnowledgeWatcher();
+            rebuildDocWatchers();
         }),
         vscode.commands.registerCommand('nrgbot.refreshProjectContext', async () => {
             provider.invalidateProjectContext();
-            await provider.warmProjectContext();
-            vscode.window.showInformationMessage('NRGBot: project context refreshed.');
+            const ctx = await provider.warmProjectContext();
+            vscode.window.showInformationMessage(`NRGBot: context refreshed \u2014 knowledge ${ctx.knowledge.length} chars, map ${ctx.map.length} chars, rules ${ctx.rules.length} chars.`);
         }),
         vscode.commands.registerCommand('nrgbot.applyProposedEdit', () => provider.applyProposedEdit()),
         vscode.commands.registerCommand('nrgbot.discardProposedEdit', () => provider.discardProposedEdit()),
+        vscode.commands.registerCommand('nrgbot.attachSelection', () => provider.attachSelectionToChat()),
+        vscode.commands.registerCommand('nrgbot.attachFile', () => provider.attachFileToChat()),
+        vscode.commands.registerCommand('nrgbot.askAboutSelection', () => provider.askAboutSelection()),
         vscode.commands.registerCommand('nrgbot.generateKnowledgeDoc', async () => {
             const folders = vscode.workspace.workspaceFolders;
             if (!folders || folders.length === 0) {
@@ -77,6 +94,28 @@ export function activate(context: vscode.ExtensionContext) {
             } catch {
                 existed = false;
                 await vscode.workspace.fs.writeFile(uri, Buffer.from(KNOWLEDGE_DOC_TEMPLATE, 'utf8'));
+                provider.invalidateProjectContext();
+            }
+            const doc = await vscode.workspace.openTextDocument(uri);
+            await vscode.window.showTextDocument(doc);
+            if (existed) {
+                vscode.window.showInformationMessage(`NRGBot: ${file} already exists; opened it.`);
+            }
+        }),
+        vscode.commands.registerCommand('nrgbot.generateRefactorRules', async () => {
+            const folders = vscode.workspace.workspaceFolders;
+            if (!folders || folders.length === 0) {
+                vscode.window.showWarningMessage('NRGBot: open a workspace folder first.');
+                return;
+            }
+            const file = vscode.workspace.getConfiguration('nrgbot').get<string>('refactorRulesFile') || DEFAULT_RULES_FILE;
+            const uri = vscode.Uri.joinPath(folders[0].uri, file);
+            let existed = true;
+            try {
+                await vscode.workspace.fs.stat(uri);
+            } catch {
+                existed = false;
+                await vscode.workspace.fs.writeFile(uri, Buffer.from(REFACTOR_RULES_TEMPLATE, 'utf8'));
                 provider.invalidateProjectContext();
             }
             const doc = await vscode.workspace.openTextDocument(uri);
@@ -113,9 +152,10 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
     private static readonly MAX_ATTACHMENT_CHARS = 50000;
 
     public lastActiveEditor: vscode.TextEditor | undefined;
+    private _view: vscode.WebviewView | undefined;
     private activeRequest: http.ClientRequest | undefined;
     private streamAborted = false;
-    private projectContext: { knowledge: string; map: string } | undefined;
+    private projectContext: ProjectContext | undefined;
     private pendingEdit: { edit: vscode.WorkspaceEdit; previewUri: vscode.Uri } | undefined;
 
     constructor(
@@ -168,54 +208,147 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    /** Attach the editor selection to the chat (right-click "Add Selection to Chat"). */
+    public attachSelectionToChat(): Promise<void> {
+        return this._attachFromEditor('selection', false);
+    }
+
+    /** Attach the whole active file to the chat (right-click "Add File to Chat"). */
+    public attachFileToChat(): Promise<void> {
+        return this._attachFromEditor('file', false);
+    }
+
+    /** Attach the selection and focus the prompt so the user can type a question. */
+    public askAboutSelection(): Promise<void> {
+        return this._attachFromEditor('selection', true);
+    }
+
+    private async _attachFromEditor(scope: 'selection' | 'file', focusPrompt: boolean): Promise<void> {
+        const ed = this.lastActiveEditor ?? vscode.window.activeTextEditor;
+        if (!ed) {
+            vscode.window.showWarningMessage('NRGBot: No editor found.');
+            return;
+        }
+        if (scope === 'selection' && ed.selection.isEmpty) {
+            vscode.window.showWarningMessage('NRGBot: Select some code first.');
+            return;
+        }
+        const fileName = vscode.workspace.asRelativePath(ed.document.uri);
+        const raw = scope === 'selection' ? ed.document.getText(ed.selection) : ed.document.getText();
+        const content = await this._confirmAttachmentSize(raw, scope === 'selection' ? 'Selection' : 'Full page');
+        if (content === undefined) return;
+        await this._revealChat(!focusPrompt);
+        const label = scope === 'selection' ? `\u2728 ${fileName} (selection)` : `\uD83D\uDCC4 ${fileName}`;
+        this._view?.webview.postMessage({ type: 'attach', label, fileName, value: content });
+        if (focusPrompt) this._view?.webview.postMessage({ type: 'focusPrompt' });
+    }
+
+    /** Reveal the chat view so a command that feeds it has somewhere to land. */
+    private async _revealChat(preserveFocus: boolean): Promise<void> {
+        if (this._view) {
+            this._view.show?.(preserveFocus);
+        } else {
+            await vscode.commands.executeCommand('ollama.chatSidebarView.focus');
+        }
+    }
+
     /** Drop the cached project context so the next request regenerates it. */
     public invalidateProjectContext(): void {
         this.projectContext = undefined;
     }
 
     /** Eagerly (re)build the cached project context, e.g. from the refresh command. */
-    public async warmProjectContext(): Promise<void> {
-        await this.getProjectContext();
+    public async warmProjectContext(): Promise<ProjectContext> {
+        return this.getProjectContext();
     }
 
-    private async getProjectContext(): Promise<{ knowledge: string; map: string }> {
+    private async getProjectContext(): Promise<ProjectContext> {
         if (this.projectContext) return this.projectContext;
         const config = vscode.workspace.getConfiguration('nrgbot');
         const knowledgeFile = config.get<string>('knowledgeFile') || DEFAULT_KNOWLEDGE_FILE;
+        const rulesFile = config.get<string>('refactorRulesFile') || DEFAULT_RULES_FILE;
         const includeMap = config.get<boolean>('includeProjectMap') !== false;
         const maxChars = config.get<number>('projectContextMaxChars') ?? DEFAULT_CONTEXT_MAX_CHARS;
         const knowledge = await readKnowledgeDoc(knowledgeFile, maxChars);
+        const rules = await readKnowledgeDoc(rulesFile, maxChars);
         const map = includeMap ? await generateProjectMap(maxChars) : '';
-        this.projectContext = { knowledge, map };
+        console.log(`[NRGBot] project context loaded: knowledge=${knowledge.length} chars from "${knowledgeFile}", map=${map.length} chars, rules=${rules.length} chars from "${rulesFile}"`);
+        this.projectContext = { knowledge, map, rules };
         return this.projectContext;
     }
 
-    private static readonly BASE_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message may already include attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>". That attached content IS the file the user is referring to; treat it as fully available and answer from it directly. Never call read_file or list_directory for a file whose content is already attached, and never claim an attached file does not exist. Do not echo or quote the complete attached file unless the user explicitly asks for it. You have read-only tools (read_file, list_directory, search_text, list_files) that give you direct access to every file in the workspace. When a question needs file contents, sizes, line counts, or the largest files, CALL THE TOOLS to gather the facts instead of asking the user to attach files or emitting placeholder values. Use list_files (with sortBy and limit) for questions about file sizes, line counts, or largest files. Never guess or fabricate file data. Never write JSON tool calls in your response. Only call tools supplied in this request; never invent a tool such as analyze_code_quality. Analyze attached code directly in your normal response. After a tool returns its result, write your final answer as plain English markdown prose. Never output JSON, JSON-RPC, an "error"/"result"/"jsonrpc" object, or any protocol message as your answer; the tool result is the real file content, so use it to answer the question. When the user asks about the project, solution, or architecture, base your answer ONLY on the "## Project knowledge" and "## Solution map" sections below. Do not invent project names, and never claim the solution uses a framework, engine, or technology (such as Unity, React, or a game engine) unless it appears in those sections. If that context does not cover the question, say what you can from it and that you do not have more detail rather than guessing.';
+    private static readonly BASE_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message may already include attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>". That attached content IS the file the user is referring to; treat it as fully available and answer from it directly. Never call read_file or list_directory for a file whose content is already attached, and never claim an attached file does not exist. Do not echo or quote the complete attached file unless the user explicitly asks for it. You have read-only tools (read_file, list_directory, search_text, list_files) that give you direct access to every file in the workspace. When a question needs file contents, sizes, line counts, or the largest files, CALL THE TOOLS to gather the facts instead of asking the user to attach files or emitting placeholder values. Use list_files (with sortBy and limit) for questions about file sizes, line counts, or largest files. Never guess or fabricate file data. Never write JSON tool calls in your response. Only call tools supplied in this request; never invent a tool such as analyze_code_quality. Analyze attached code directly in your normal response. After a tool returns its result, write your final answer as plain English markdown prose. Never output JSON, JSON-RPC, an "error"/"result"/"jsonrpc" object, or any protocol message as your answer; the tool result is the real file content, so use it to answer the question.';
+
+    // Leads the prompt for plain project questions so the model anchors on the real codebase before
+    // wading through tool mechanics; directly counters the "Starfish is a metaphor/joke" failure.
+    private static readonly GROUNDING_PREAMBLE = 'You are NRGBot, the coding assistant for the "Starfish" solution \u2014 the actual software codebase open in this VS Code workspace. "Starfish", "the Starfish solution", "the solution", "this project", and "the codebase" ALL refer to that codebase. The "## Project knowledge" and "## Solution map" sections below are the authoritative, factual description of it; treat everything in them as true. When the user asks about the project, solution, or architecture, answer ONLY from those sections. Never describe "Starfish" as a metaphor, idiom, joke, methodology, or generic problem-solving concept \u2014 it is a real .NET/C++ radio-gateway product. Do not invent project names, and never claim it uses a framework, engine, or technology (such as Unity, React, or a game engine) that is not named in those sections. If the sections do not cover the question, answer with what they do say and note you lack further detail rather than guessing.';
 
     // Used when the message already carries an attached file: no tools are offered, so the prompt
     // must not mention them or a weak model will still write a tool call as text and stall.
-    private static readonly ATTACHMENT_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message includes attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>". That attached content IS the file the user is asking about and is fully available to you. Analyze it directly and answer in plain English markdown prose. You have NO tools available: do not call, request, or mention any tool (read_file, list_files, etc.), do not ask the user to run or confirm anything, and do not ask for the file or claim you lack access. Never output JSON, a tool call, an "error"/"result"/"jsonrpc" object, or any protocol message \u2014 just write your analysis. Do not echo or quote the entire file unless the user explicitly asks.';
+    private static readonly ATTACHMENT_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message includes attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>". That attached content IS the file the user is asking about and is fully available to you. Analyze it directly and answer in plain English markdown prose. When the user asks you to refactor, rewrite, clean up, improve, document, or otherwise change the attached code, DO IT and return the improved code in a fenced code block \u2014 this is a normal, allowed request about the user\'s own workspace code, so never refuse it or reply that you can\'t assist. You have NO tools available: do not call, request, or mention any tool (read_file, list_files, etc.), do not ask the user to run or confirm anything, and do not ask for the file or claim you lack access. Never output JSON, a tool call, an "error"/"result"/"jsonrpc" object, or any protocol message \u2014 just write your analysis. Do not echo or quote the entire file unless the user explicitly asks.';
 
     // Attached file PLUS a question that needs other files (usages, references, callers): tools stay on.
     private static readonly ATTACHMENT_WITH_TOOLS_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message includes attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>"; treat that attached content as fully available. The user\'s question needs information from OTHER files in the workspace (for example, where a symbol is used or referenced). Use the read-only tools to find it: search_text to find where a name appears across the workspace, list_files to locate files, and read_file to inspect another file. Call one tool at a time and wait for its result before the next. After the tools return, write your final answer as plain English markdown prose that cites the files and lines you found. Never ask the user to attach or paste files, never say you lack workspace access, and never output JSON, a bare tool call, or any protocol message as your final answer.';
 
+    // The user asked to examine/read real files. A big grounding prompt suppresses tool-calling in a
+    // 14b model, so this lean, tool-forward prompt is used instead to force an actual tool call.
+    private static readonly FILE_ACTION_SYSTEM_PROMPT = 'You are NRGBot, the coding assistant for the "Starfish" .NET/C++ radio-gateway solution open in this VS Code workspace. You have DIRECT read-only access to every file in the workspace through tools: list_files (use sortBy and limit for file sizes, line counts, or the largest files), list_directory, read_file, and search_text. The user wants you to look at real files, so you MUST call the appropriate tool now and base your answer on the result. Call the tool immediately without narrating it in prose. Call one tool at a time and wait for its result before the next. NEVER say you cannot access, browse, open, list, or interact with files, never claim to be "just a text-based model", and never ask the user to attach or paste files \u2014 read them yourself. After the tools return, write your answer as plain English markdown prose. Never output JSON, a bare tool call, or any protocol message as your final answer.';
+
+    // Once tool results are in the conversation the model must stop calling tools and answer ONCE;
+    // re-sending the tool-forward prompt here is what made it call again / answer twice.
+    private static readonly POST_TOOL_SYSTEM_PROMPT = 'You are NRGBot, the coding assistant for the "Starfish" .NET/C++ radio-gateway solution. You have already called one or more tools and their results appear in this conversation as tool messages. Write a SINGLE final answer to the user\'s question in plain English markdown prose, using those results. Do NOT call the same tool again, do NOT repeat or restate your answer, and do NOT output JSON or any tool-call text. Only call another tool if it is genuinely required to finish answering, and then give one final answer.';
+
     private buildSystemPrompt(
-        context: { knowledge: string; map: string },
-        opts: { hasAttachment?: boolean; offerTools?: boolean } = {}
+        context: ProjectContext,
+        opts: { hasAttachment?: boolean; offerTools?: boolean; fileAction?: boolean; hasToolResults?: boolean } = {}
     ): string {
         if (opts.hasAttachment) {
-            return opts.offerTools
+            const base = opts.offerTools
                 ? OllamaViewProvider.ATTACHMENT_WITH_TOOLS_SYSTEM_PROMPT
                 : OllamaViewProvider.ATTACHMENT_SYSTEM_PROMPT;
+            return this._appendRules(base, context.rules);
         }
-        const parts = [OllamaViewProvider.BASE_SYSTEM_PROMPT];
+        // Tool results already gathered: instruct a single final answer so the model stops re-calling.
+        if (opts.hasToolResults) {
+            return OllamaViewProvider.POST_TOOL_SYSTEM_PROMPT;
+        }
+        // An explicit "look at the files" request needs a lean prompt so tool-calling isn't drowned.
+        if (opts.fileAction) {
+            return OllamaViewProvider.FILE_ACTION_SYSTEM_PROMPT;
+        }
+        // Knowledge/map are delivered as recent conversation turns (see _buildKnowledgeTurns), which a
+        // small model attends to far better than a long system prompt, so the system message stays lean.
+        const parts: string[] = [];
+        if (context.knowledge || context.map) {
+            parts.push(OllamaViewProvider.GROUNDING_PREAMBLE);
+        }
+        parts.push(OllamaViewProvider.BASE_SYSTEM_PROMPT);
+        return parts.join('\n\n');
+    }
+
+    // Append the workspace refactoring rules so every attached-file coding request must follow them.
+    private _appendRules(prompt: string, rules: string): string {
+        if (!rules) return prompt;
+        return `${prompt}\n\nWhen you write or change any code, you MUST follow these project refactoring rules:\n\n${rules}`;
+    }
+
+    // Deliver the project knowledge as a recent user/assistant exchange rather than burying it in a
+    // 16KB system prompt; a small model attends to recent turns far more reliably than a long system block.
+    private _buildKnowledgeTurns(context: { knowledge: string; map: string }): { role: string; content: string }[] {
+        const ref: string[] = [];
         if (context.knowledge) {
-            parts.push('## Project knowledge (Starfish)\n' + context.knowledge);
+            ref.push('## Project knowledge\n' + context.knowledge);
         }
         if (context.map) {
-            parts.push('## Solution map\n' + context.map);
+            ref.push('## Solution map\n' + context.map);
         }
-        return parts.join('\n\n');
+        if (ref.length === 0) {
+            return [];
+        }
+        return [
+            { role: 'user', content: 'Here is the authoritative reference for the "Starfish" solution \u2014 the actual codebase open in this workspace. Use ONLY this reference to answer questions about the project, its architecture, and its files:\n\n' + ref.join('\n\n') },
+            { role: 'assistant', content: 'Understood \u2014 Starfish is this workspace\'s .NET/C++ radio-gateway solution. I will answer from that reference and will not invent names or technologies that are not in it.' }
+        ];
     }
 
     // A question about usages/references/callers needs other files, so keep tools on even with an
@@ -236,174 +369,42 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             || /\bfind\b[^?]*\b(project|codebase|solution|workspace|repo)\b/i.test(question);
     }
 
-    public resolveWebviewView(webviewView: vscode.WebviewView) {
+    // An action request to inspect real files ("examine the files", "open X", "read Y", "list the
+    // projects"). Used to swap in the lean tool-forward prompt so the model actually calls a tool.
+    private _questionIsFileAction(
+        messages: { role: string; content: string | null }[]
+    ): boolean {
+        const lastUser = [...messages].reverse().find(m => m.role === 'user' && typeof m.content === 'string');
+        const raw = lastUser?.content;
+        if (typeof raw !== 'string' || raw.includes('Attached file:')) return false;
+        return /\b(examine|inspect|look at|read|open|show|browse|review|analyze|analyse|check|list|explore|scan|dig into|go through)\b[^.?!]{0,40}\b(file|files|code|contents?|directory|directories|folder|folders|project|projects|solution|class|classes|method|methods|source)\b/i.test(raw)
+            || /\b(list|show)\b[^.?!]{0,20}\b(files?|projects?|directories|folders?)\b/i.test(raw)
+            || /\b(largest|biggest|smallest)\b[^.?!]{0,20}\b(files?|projects?)\b/i.test(raw);
+    }
+
+    /** Load the webview markup from media/webview.html, substituting the runtime URIs. */
+    private async _getHtmlForWebview(webview: vscode.Webview): Promise<string> {
+        const mediaRoot = vscode.Uri.joinPath(this.extensionUri, 'media');
+        const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'webview.js'));
+        const codiconUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'codicon.css'));
+        const template = Buffer.from(
+            await vscode.workspace.fs.readFile(vscode.Uri.joinPath(mediaRoot, 'webview.html'))
+        ).toString('utf8');
+        return template
+            .replace(/{{cspSource}}/g, webview.cspSource)
+            .replace(/{{codiconUri}}/g, codiconUri.toString())
+            .replace(/{{scriptUri}}/g, scriptUri.toString());
+    }
+
+    public async resolveWebviewView(webviewView: vscode.WebviewView) {
+        this._view = webviewView;
         const mediaRoot = vscode.Uri.joinPath(this.extensionUri, 'media');
         webviewView.webview.options = { enableScripts: true, localResourceRoots: [mediaRoot] };
-        const scriptUri = webviewView.webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'webview.js'));
-        const codiconUri = webviewView.webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'codicon.css'));
-        const csp = `default-src 'none'; style-src ${webviewView.webview.cspSource} 'unsafe-inline'; script-src ${webviewView.webview.cspSource}; font-src ${webviewView.webview.cspSource};`;
-
-        webviewView.webview.html = `
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta http-equiv="Content-Security-Policy" content="${csp}">
-    <link href="${codiconUri}" rel="stylesheet" />
-    <style>
-        :root {
-            --nrg-accent: #3fb950;
-            --nrg-accent-hover: #4fc862;
-            --nrg-accent-soft: rgba(63, 185, 80, 0.14);
-            --nrg-accent-border: rgba(63, 185, 80, 0.42);
-            --nrg-radius: 10px;
+        try {
+            webviewView.webview.html = await this._getHtmlForWebview(webviewView.webview);
+        } catch (err) {
+            webviewView.webview.html = `<!DOCTYPE html><body style="font-family:sans-serif;padding:12px">Failed to load NRGBot UI: ${String(err)}</body>`;
         }
-        * { box-sizing: border-box; }
-        html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; background: var(--vscode-sideBar-background, var(--vscode-editor-background)); }
-        body { display: flex; flex-direction: column; font-family: var(--vscode-font-family, sans-serif); font-size: 13px; padding: 10px; color: var(--vscode-foreground); }
-
-        /* Header / branding */
-        .app-header { display: flex; align-items: center; gap: 8px; padding-bottom: 8px; margin-bottom: 8px; border-bottom: 1px solid var(--vscode-panel-border); }
-        .brand { display: flex; align-items: center; gap: 7px; font-weight: 600; letter-spacing: 0.2px; }
-        .brand-mark { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; background: var(--nrg-accent-soft); color: var(--nrg-accent); border: 1px solid var(--nrg-accent-border); }
-        .brand-mark .codicon { font-size: 15px; }
-        .brand-name b { color: var(--nrg-accent); }
-        .header-actions { margin-left: auto; display: flex; gap: 4px; }
-        .icon-btn { width: 28px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; color: var(--vscode-foreground); border: 1px solid transparent; border-radius: 6px; cursor: pointer; margin: 0; }
-        .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,0.15)); }
-        .icon-btn .codicon { font-size: 16px; }
-
-        /* Chat area */
-        #chat-box { flex: 1; overflow-y: auto; padding: 4px 2px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 14px; }
-        .msg { display: flex; gap: 9px; align-items: flex-start; animation: nrg-fade 0.18s ease-out; }
-        @keyframes nrg-fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
-        .msg-avatar { flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; }
-        .msg-avatar .codicon { font-size: 14px; }
-        .msg.user .msg-avatar { background: var(--vscode-input-background); color: var(--vscode-foreground); border: 1px solid var(--vscode-panel-border); }
-        .msg.ai .msg-avatar { background: var(--nrg-accent-soft); color: var(--nrg-accent); border: 1px solid var(--nrg-accent-border); }
-        .msg-body { flex: 1; min-width: 0; }
-        .msg-author { font-size: 11px; font-weight: 600; opacity: 0.7; margin-bottom: 3px; letter-spacing: 0.3px; }
-        .msg.ai .msg-author { color: var(--nrg-accent); opacity: 0.9; }
-        .msg-content { border-radius: var(--nrg-radius); padding: 8px 11px; line-height: 1.5; overflow-wrap: anywhere; }
-        .msg.user .msg-content { background: var(--nrg-accent-soft); border: 1px solid var(--nrg-accent-border); white-space: pre-wrap; }
-        .msg.ai .msg-content { background: var(--vscode-textBlockQuote-background, rgba(127,127,127,0.08)); border: 1px solid var(--vscode-panel-border); }
-        .msg-content > :first-child { margin-top: 0; }
-        .msg-content > :last-child { margin-bottom: 0; }
-        .msg-content p, .msg-content ul, .msg-content ol { margin: 0.4em 0; }
-        .msg-content code { font-family: var(--vscode-editor-font-family, monospace); background: var(--vscode-textCodeBlock-background); padding: 1px 5px; border-radius: 4px; font-size: 0.92em; }
-        .msg-content h1, .msg-content h2, .msg-content h3 { margin: 0.6em 0 0.3em; line-height: 1.3; }
-
-        /* Code blocks */
-        .code-block { margin: 0.5em 0; border: 1px solid var(--vscode-panel-border); border-radius: 8px; overflow: hidden; background: var(--vscode-textCodeBlock-background); }
-        .code-head { display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: var(--vscode-editorGroupHeader-tabsBackground, rgba(127,127,127,0.12)); border-bottom: 1px solid var(--vscode-panel-border); }
-        .code-lang { font-size: 11px; text-transform: lowercase; opacity: 0.7; font-family: var(--vscode-editor-font-family, monospace); }
-        .code-head-actions { margin-left: auto; display: flex; gap: 2px; }
-        .code-head-actions .icon-btn { width: 22px; height: 22px; }
-        .code-head-actions .icon-btn .codicon { font-size: 13px; }
-        .code-block pre { margin: 0; padding: 9px 11px; overflow-x: auto; background: none; }
-        .code-block pre code { padding: 0; background: none; font-size: 0.9em; }
-
-        /* Tables */
-        .md-table { border-collapse: collapse; margin: 0.5em 0; font-size: 0.9em; max-width: 100%; display: block; overflow-x: auto; }
-        .md-table th, .md-table td { border: 1px solid var(--vscode-panel-border); padding: 5px 9px; text-align: left; }
-        .md-table th { background: var(--vscode-textBlockQuote-background); font-weight: 600; }
-
-        /* Tool notes, typing, status */
-        .tool-note { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; opacity: 0.8; font-family: var(--vscode-editor-font-family, monospace); margin: 3px 0; padding: 2px 8px; background: var(--vscode-input-background); border: 1px solid var(--vscode-panel-border); border-radius: 20px; }
-        .tool-note .codicon { font-size: 12px; color: var(--nrg-accent); }
-        .typing { display: inline-flex; gap: 4px; padding: 5px 2px; align-items: center; }
-        .typing span { width: 6px; height: 6px; border-radius: 50%; background: var(--nrg-accent); animation: nrg-typing 1s infinite ease-in-out; }
-        .typing span:nth-child(2) { animation-delay: 0.15s; }
-        .typing span:nth-child(3) { animation-delay: 0.3s; }
-        @keyframes nrg-typing { 0%, 60%, 100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-4px); opacity: 1; } }
-        .stream-status.failed { display: flex; align-items: center; gap: 6px; margin-top: 8px; padding: 6px 9px; border-radius: 6px; font-size: 12px; color: var(--vscode-inputValidation-warningForeground, var(--vscode-editor-foreground)); background: var(--vscode-inputValidation-warningBackground, rgba(181,137,0,0.15)); border: 1px solid var(--vscode-inputValidation-warningBorder, #b58900); }
-        .msg-footer { display: flex; gap: 6px; margin-top: 8px; }
-
-        /* Empty / welcome state */
-        .welcome { margin: auto; text-align: center; padding: 24px 16px; }
-        .welcome-mark { width: 46px; height: 46px; border-radius: 12px; background: var(--nrg-accent-soft); color: var(--nrg-accent); border: 1px solid var(--nrg-accent-border); display: inline-flex; align-items: center; justify-content: center; margin-bottom: 12px; }
-        .welcome-mark .codicon { font-size: 26px; }
-        .welcome h2 { margin: 0 0 4px; font-size: 15px; }
-        .welcome h2 b { color: var(--nrg-accent); }
-        .welcome p { margin: 0 0 14px; font-size: 12px; opacity: 0.75; }
-        .welcome-hints { display: flex; flex-direction: column; gap: 6px; max-width: 250px; margin: 0 auto; }
-        .welcome-hint { display: flex; align-items: center; gap: 8px; text-align: left; font-size: 12px; padding: 7px 10px; border: 1px solid var(--vscode-panel-border); border-radius: 8px; background: var(--vscode-input-background); }
-        .welcome-hint .codicon { color: var(--nrg-accent); font-size: 14px; flex: 0 0 auto; }
-
-        /* Bottom tray */
-        .bottom-tray { display: flex; flex-direction: column; width: 100%; gap: 7px; }
-        #attachments { display: flex; flex-wrap: wrap; gap: 6px; }
-        #attachments:empty { display: none; }
-        .chip { display: inline-flex; align-items: center; gap: 5px; background: var(--nrg-accent-soft); color: var(--vscode-foreground); border: 1px solid var(--nrg-accent-border); padding: 3px 8px; border-radius: 20px; font-size: 11px; max-width: 100%; }
-        .chip-icon { color: var(--nrg-accent); font-size: 12px; }
-        .chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
-        .chip-close { cursor: pointer; opacity: 0.6; font-size: 13px; display: inline-flex; }
-        .chip-close:hover { opacity: 1; color: var(--vscode-inputValidation-errorForeground, #f14c4c); }
-        .tray-row { display: flex; gap: 6px; }
-        .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 10px; background: var(--vscode-button-secondaryBackground, var(--vscode-input-background)); color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); border: 1px solid var(--vscode-panel-border); border-radius: 7px; cursor: pointer; font-size: 12px; margin: 0; width: auto; }
-        .btn:hover { background: var(--vscode-button-secondaryHoverBackground, var(--vscode-toolbar-hoverBackground, rgba(127,127,127,0.15))); }
-        .btn .codicon { font-size: 14px; }
-        .btn.grow { flex: 1; }
-        textarea { width: 100%; min-height: 62px; max-height: 200px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 8px; resize: none; padding: 8px 10px; font-family: inherit; font-size: 13px; box-sizing: border-box; }
-        textarea:focus { outline: none; border-color: var(--nrg-accent); box-shadow: 0 0 0 1px var(--nrg-accent-border); }
-        .btn-primary { display: inline-flex; align-items: center; justify-content: center; gap: 7px; width: 100%; padding: 8px; background: var(--nrg-accent); color: #08260f; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 13px; margin: 0; }
-        .btn-primary:hover { background: var(--nrg-accent-hover); }
-        .btn-primary .codicon { font-size: 15px; }
-        #send-btn.stop-mode { background: var(--vscode-inputValidation-errorBackground, #5a1d1d); color: var(--vscode-inputValidation-errorForeground, #fff); }
-        #send-btn.stop-mode:hover { background: var(--vscode-inputValidation-errorBorder, #be1100); }
-
-        /* Settings panel */
-        .settings-panel { border: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); padding: 10px; margin-bottom: 10px; border-radius: 8px; }
-        .settings-label { display: block; font-size: 10px; opacity: 0.7; margin: 8px 0 3px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
-        .settings-label:first-child { margin-top: 0; }
-        .settings-row { display: flex; gap: 5px; align-items: center; }
-        .settings-row input, .settings-row select { flex: 1; min-width: 0; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 6px; padding: 5px 7px; box-sizing: border-box; font-size: 12px; }
-        .settings-row input:focus, .settings-row select:focus { outline: none; border-color: var(--nrg-accent); }
-        .settings-status { font-size: 11px; margin-top: 8px; min-height: 1em; opacity: 0.85; display: flex; align-items: center; gap: 5px; }
-        .settings-status .codicon { color: var(--nrg-accent); font-size: 13px; }
-        .settings-status.error { color: var(--vscode-inputValidation-warningForeground, #b58900); }
-        .settings-status.error .codicon { color: var(--vscode-inputValidation-warningForeground, #b58900); }
-    </style>
-</head>
-<body>
-    <div class="app-header">
-        <div class="brand">
-            <span class="brand-mark"><i class="codicon codicon-zap"></i></span>
-            <span class="brand-name">NRG<b>Bot</b></span>
-        </div>
-        <div class="header-actions">
-            <button id="settings-btn" class="icon-btn" title="Settings"><i class="codicon codicon-settings-gear"></i></button>
-            <button id="clear-btn" class="icon-btn" title="New chat"><i class="codicon codicon-add"></i></button>
-        </div>
-    </div>
-    <div id="settings-panel" class="settings-panel" style="display:none;">
-        <label class="settings-label" for="server-url">Server URL</label>
-        <div class="settings-row">
-            <input id="server-url" type="text" placeholder="http://localhost:11434" />
-            <button id="connect-btn" class="btn" title="Connect &amp; refresh models"><i class="codicon codicon-plug"></i> Connect</button>
-        </div>
-        <label class="settings-label" for="model-select">Model</label>
-        <div class="settings-row">
-            <select id="model-select"></select>
-            <button id="refresh-models-btn" class="icon-btn" title="Refresh model list"><i class="codicon codicon-refresh"></i></button>
-        </div>
-        <div id="settings-status" class="settings-status"></div>
-    </div>
-    <div id="chat-box"></div>
-
-    <div class="bottom-tray">
-        <div id="attachments"></div>
-        <div class="tray-row">
-            <button id="grab-btn" class="btn grow"><i class="codicon codicon-list-selection"></i> Selection</button>
-            <button id="page-btn" class="btn grow"><i class="codicon codicon-file-code"></i> Full Page</button>
-        </div>
-        <textarea id="prompt" placeholder="Ask NRGBot\u2026"></textarea>
-        <button id="send-btn" class="btn-primary"><i class="codicon codicon-send"></i> Send</button>
-    </div>
-
-    <script src="${scriptUri}"></script>
-</body>
-</html>`;
 
         webviewView.webview.onDidReceiveMessage(async (data) => {
             if (data.type === 'sendPrompt') {
@@ -605,9 +606,11 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
     private _looksLikeMissingFileAccess(text: string): boolean {
         if (!text) return false;
         return /\b(hypothetical|placeholder|rough estimate)\b/i.test(text)
-            || /(attach|provide|share|paste)\b[^.]{0,50}\b(file|files|code|contents?)\b/i.test(text)
+            || /(attach|provide|share|paste)\w*\b[^.]{0,50}\b(file|files|code|contents?)\b/i.test(text)
             || /\bI (do not|don'?t) have (direct )?(access|visibility)\b/i.test(text)
-            || /\bwithout (access to|seeing|the actual)\b/i.test(text);
+            || /\bwithout (access to|seeing|the actual)\b/i.test(text)
+            || /\b(can'?t|cannot|can not|unable to|not able to|no ability to|don'?t have the (ability|capability)|not capable of)\b[^.]{0,60}\b(access|open|read|browse|view|see|interact|analyz|inspect)\w*/i.test(text)
+            || /\bas an?\s+(ai|language|text[- ]based)\s+(model|assistant)\b/i.test(text);
     }
 
     // Weak models sometimes reply with a bare JSON blob (an echoed call, a fake {"error":...} or
@@ -635,6 +638,16 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         try { JSON.parse(s.slice(0, endIdx + 1)); } catch { return false; }
         // Bare JSON only if little/no prose follows the object.
         return s.slice(endIdx + 1).trim().length <= 40;
+    }
+
+    // Weak models sometimes emit a canned safety refusal ("I can't assist with that") for a perfectly
+    // legitimate coding request. Detect a short reply that is essentially just such a refusal.
+    private _looksLikeBogusRefusal(text: string): boolean {
+        if (!text) return false;
+        const s = text.trim();
+        if (s.length > 200) return false;
+        return /\b(i(?:'|\u2019)?m sorry|i am sorry|sorry|unfortunately)\b[^.]{0,40}\b(can(?:'|\u2019)?t|cannot|can not|not able to|unable to|won(?:'|\u2019)?t)\b[^.]{0,20}\b(assist|help|do that|comply|with that)\b/i.test(s)
+            || /\bi\s+(can(?:'|\u2019)?t|cannot|can not|am (?:un)?able to|won(?:'|\u2019)?t)\s+(assist|help)\b/i.test(s);
     }
 
     private async _streamFromOllama(
@@ -671,6 +684,17 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             if (!retried && this._looksLikeBareJsonAnswer(result.content)) {
                 webview.postMessage({ type: 'retry' });
                 const reminder = 'Your previous reply was raw JSON, which is not a valid answer. Any file content you needed has already been provided. Answer the user\'s question now in plain English markdown prose. Do NOT output JSON, an "error" object, a "jsonrpc"/"result" object, or any protocol message.';
+                const nudged = [
+                    ...messages,
+                    { role: 'assistant', content: result.content || null },
+                    { role: 'user', content: reminder }
+                ];
+                await this._streamFromOllama(nudged, webview, depth + 1, true, seenToolCalls);
+                return;
+            }
+            if (!retried && this._looksLikeBogusRefusal(result.content)) {
+                webview.postMessage({ type: 'retry' });
+                const reminder = 'That is a normal, allowed coding request about the user\'s own workspace code \u2014 do not refuse it. Complete it now: analyze or refactor the attached code and give your full answer in plain English markdown, including any improved code in fenced code blocks.';
                 const nudged = [
                     ...messages,
                     { role: 'assistant', content: result.content || null },
@@ -732,7 +756,7 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         messages: { role: string; content: string | null; tool_calls?: unknown[]; tool_call_id?: string }[],
         webview: vscode.Webview,
         toolsEnabled: boolean,
-        projectContext: { knowledge: string; map: string }
+        projectContext: ProjectContext
     ): Promise<{ content: string; toolCalls: { id: string; name: string; arguments: string }[] } | null> {
         return new Promise((resolve) => {
             if (this.activeRequest) {
@@ -755,19 +779,45 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             const isHttps = parsedUrl.protocol === 'https:';
             const transport = isHttps ? https : http;
 
-            const hasAttachment = messages.some(m =>
-                m.role === 'user' && typeof m.content === 'string' && m.content.includes('Attached file:'));
-            // Attaching a file normally suppresses tools (keeps a small model focused on the paste),
-            // but cross-file questions (usages/references) still need them, so re-enable in that case.
-            const offerTools = toolsEnabled && (!hasAttachment || this._questionNeedsWorkspaceLookup(messages));
+            // Attachment mode is decided by the CURRENT turn only: scanning the whole history would
+            // keep every later message in attachment mode (dropping project knowledge and tools) long
+            // after the user removed the chip.
+            const lastUser = [...messages].reverse().find(m => m.role === 'user' && typeof m.content === 'string');
+            const hasAttachment = typeof lastUser?.content === 'string' && lastUser.content.includes('Attached file:');
+            // Tool availability is deliberately narrow so the model answers grounded project questions
+            // from the knowledge doc instead of tool-calling into an unrelated file ramble. Tools are
+            // offered only when: an attachment asks a cross-file question; the user explicitly asks to
+            // inspect files; or there is no project knowledge to answer from.
+            const isFileAction = this._questionIsFileAction(messages);
+            const hasKnowledge = !!(projectContext.knowledge || projectContext.map);
+            let offerTools: boolean;
+            if (hasAttachment) {
+                offerTools = toolsEnabled && this._questionNeedsWorkspaceLookup(messages);
+            } else if (isFileAction) {
+                offerTools = toolsEnabled;
+            } else {
+                offerTools = toolsEnabled && !hasKnowledge;
+            }
+            // A file-action request with tools on gets the lean tool-forward prompt so the large
+            // grounding context doesn't suppress the model's tool call.
+            const fileAction = offerTools && !hasAttachment && isFileAction;
+            // After a tool has run, its result is in the conversation; switch to the answer-once prompt.
+            const hasToolResults = messages.some(m => m.role === 'tool');
+            const injectKnowledge = !hasAttachment && !fileAction && !hasToolResults && hasKnowledge;
             const systemMessage = {
                 role: 'system',
-                content: this.buildSystemPrompt(projectContext, { hasAttachment, offerTools })
+                content: this.buildSystemPrompt(projectContext, { hasAttachment, offerTools, fileAction, hasToolResults })
             };
+            // Knowledge is delivered as recent turns (not the system prompt) so a small model actually uses it.
+            const contextTurns = injectKnowledge ? this._buildKnowledgeTurns(projectContext) : [];
+            // Ollama defaults to 0.8, which makes a small model ramble and drift off the grounded
+            // context; a low temperature keeps answers factual and repeatable.
+            const temperature = config.get<number>('temperature') ?? 0.2;
             const postData = JSON.stringify({
                 model: modelName,
-                messages: [systemMessage, ...messages],
+                messages: [systemMessage, ...contextTurns, ...messages],
                 stream: true,
+                temperature,
                 ...(offerTools ? { tools: TOOLS } : {})
             });
 
@@ -894,19 +944,17 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                         }
                     }
                     // Weaker models sometimes bury the tool-call JSON inside prose rather than leading with it.
-                    // Only treat it as a real call when the JSON is essentially the whole message; otherwise it is
-                    // a genuine answer that merely contains JSON (a code sample or an echoed example), and hijacking
-                    // it would wipe the answer and restart the turn in a loop.
+                    // A tool call means the model hasn't produced its answer yet, so only prose that FOLLOWS the
+                    // JSON signals a genuine answer; leading narration ("I'll call list_files ... here it is:") is
+                    // fine. Reject only when a real answer or a code block wraps the JSON (a genuine example).
                     if (toolCalls.length === 0) {
                         const embedded = findToolCallJson(content);
                         if (embedded && isKnownTool(embedded.name)) {
-                            const before = content.slice(0, embedded.startIdx);
                             const after = content.slice(embedded.endIdx + 1);
-                            const proseAround = (before + after)
-                                .replace(/<\/?tool_call>/gi, '')
-                                .replace(/```(?:json)?/gi, '')
-                                .trim();
-                            if (proseAround.length <= 40) {
+                            // A tool call means the model hasn't answered yet, so only substantial prose AFTER
+                            // the JSON signals a genuine answer; leading narration and ```json fencing are fine.
+                            const afterProse = after.replace(/<\/?tool_call>/gi, '').replace(/```(?:json)?/gi, '').trim();
+                            if (afterProse.length <= 40) {
                                 toolCalls = [{ id: `fallback-${Date.now()}`, name: embedded.name, arguments: embedded.arguments }];
                                 content = '';
                                 // The raw JSON already streamed to the view; clear it so the real result replaces it.

@@ -1,7 +1,26 @@
 import * as vscode from 'vscode';
 
 export const DEFAULT_KNOWLEDGE_FILE = '.nrgbot/knowledge.md';
+export const DEFAULT_RULES_FILE = '.nrgbot/refactor-rules.md';
 export const DEFAULT_CONTEXT_MAX_CHARS = 6000;
+
+export const REFACTOR_RULES_TEMPLATE = `# Refactoring rules
+
+<!-- NRGBot follows these rules on every attached-file coding request. Be concrete and imperative. -->
+
+## Style
+- Keep changes minimal and focused; do not rewrite unrelated code.
+- Preserve existing public APIs and behavior unless explicitly asked to change them.
+
+## Naming
+- Follow the surrounding file's naming and formatting conventions.
+
+## Structure
+- Prefer small, well-named methods over large blocks.
+
+## Comments
+- Keep comments short; explain only what the code cannot show on its own.
+`;
 
 export const KNOWLEDGE_DOC_TEMPLATE = `# Project knowledge
 
