@@ -4,6 +4,13 @@
     const promptInput = document.getElementById('prompt');
     const attachmentsEl = document.getElementById('attachments');
     const sendBtn = document.getElementById('send-btn');
+    const settingsBtn = document.getElementById('settings-btn');
+    const settingsPanel = document.getElementById('settings-panel');
+    const serverUrlInput = document.getElementById('server-url');
+    const modelSelect = document.getElementById('model-select');
+    const connectBtn = document.getElementById('connect-btn');
+    const refreshModelsBtn = document.getElementById('refresh-models-btn');
+    const settingsStatus = document.getElementById('settings-status');
     let currentAi = null;
     let currentAiContent = null;
     let currentToolLog = null;
@@ -210,6 +217,30 @@
         vscode.postMessage({ type: 'grabPage' });
     });
 
+    settingsBtn.addEventListener('click', () => {
+        const showing = settingsPanel.style.display !== 'none';
+        settingsPanel.style.display = showing ? 'none' : 'block';
+        if (!showing) vscode.postMessage({ type: 'getModels' });
+    });
+    connectBtn.addEventListener('click', () => {
+        const url = serverUrlInput.value.trim();
+        if (!url) return;
+        settingsStatus.className = 'settings-status';
+        settingsStatus.textContent = 'Connecting...';
+        vscode.postMessage({ type: 'setServerUrl', value: url });
+    });
+    refreshModelsBtn.addEventListener('click', () => {
+        settingsStatus.className = 'settings-status';
+        settingsStatus.textContent = 'Loading models...';
+        vscode.postMessage({ type: 'getModels' });
+    });
+    modelSelect.addEventListener('change', () => {
+        if (!modelSelect.value) return;
+        vscode.postMessage({ type: 'setModel', value: modelSelect.value });
+        settingsStatus.className = 'settings-status';
+        settingsStatus.textContent = 'Model set to ' + modelSelect.value;
+    });
+
     chatBox.addEventListener('click', (e) => {
         const btn = e.target.closest('.apply-btn, .copy-btn');
         if (!btn) return;
@@ -239,9 +270,25 @@
             attachments.push({ label: msg.label, fileName: msg.fileName, value: msg.value });
             renderAttachments();
         } else if (msg.type === 'error') {
-            currentAi.classList.remove('pending');
-            currentAiContent.innerText = 'Error: ' + msg.value;
+            if (currentAi) currentAi.classList.remove('pending');
+            if (currentAiContent) currentAiContent.innerText = 'Error: ' + msg.value;
             conversation.pop();
+            setStreaming(false);
+        } else if (msg.type === 'streamError') {
+            // Mid-stream drop: keep whatever streamed so far and show a failed indicator.
+            if (currentAi) {
+                currentAi.classList.remove('pending');
+                if (currentAiRaw) {
+                    currentAiContent.innerHTML = renderMarkdown(currentAiRaw);
+                    conversation.push({ role: 'assistant', content: currentAiRaw });
+                } else {
+                    conversation.pop();
+                }
+                const note = document.createElement('div');
+                note.className = 'stream-status failed';
+                note.textContent = '\u26A0 ' + (msg.value || 'Connection lost before the response finished.');
+                currentAi.appendChild(note);
+            }
             setStreaming(false);
         } else if (msg.type === 'done') {
             setStreaming(false);
@@ -267,6 +314,34 @@
                 footer.appendChild(copyAllBtn);
                 currentAi.appendChild(footer);
             }
+        } else if (msg.type === 'models') {
+            if (typeof msg.serverUrl === 'string' && document.activeElement !== serverUrlInput) {
+                serverUrlInput.value = msg.serverUrl;
+            }
+            const models = Array.isArray(msg.models) ? msg.models : [];
+            modelSelect.innerHTML = '';
+            const names = models.slice();
+            // Always include the configured model so the current selection is visible even if the fetch failed.
+            if (msg.current && names.indexOf(msg.current) === -1) names.unshift(msg.current);
+            names.forEach(name => {
+                const opt = document.createElement('option');
+                opt.value = name;
+                opt.textContent = name;
+                if (name === msg.current) opt.selected = true;
+                modelSelect.appendChild(opt);
+            });
+            if (msg.error) {
+                settingsStatus.className = 'settings-status error';
+                settingsStatus.textContent = '\u26A0 ' + msg.error;
+            } else {
+                settingsStatus.className = 'settings-status';
+                settingsStatus.textContent = models.length
+                    ? models.length + ' model' + (models.length === 1 ? '' : 's') + ' available'
+                    : 'No models found on the server.';
+            }
         }
     });
+
+    // Populate the server URL + model list on load.
+    vscode.postMessage({ type: 'getModels' });
 })();

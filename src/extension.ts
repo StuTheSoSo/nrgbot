@@ -5,14 +5,36 @@ import { TOOLS, executeTool, isKnownTool } from './tools';
 import { extractLeadingToolCallJson } from './parsing';
 
 export function activate(context: vscode.ExtensionContext) {
-    const provider = new OllamaViewProvider(context.extensionUri);
+    const previewProvider = new ApplyPreviewProvider();
+    const provider = new OllamaViewProvider(context.extensionUri, previewProvider);
     context.subscriptions.push(
+        vscode.workspace.registerTextDocumentContentProvider(ApplyPreviewProvider.scheme, previewProvider),
         vscode.window.registerWebviewViewProvider('ollama.chatSidebarView', provider),
         vscode.window.onDidChangeActiveTextEditor(editor => {
             if (editor) provider.lastActiveEditor = editor;
         })
     );
     if (vscode.window.activeTextEditor) provider.lastActiveEditor = vscode.window.activeTextEditor;
+}
+
+/** Serves the proposed post-apply file content for the `vscode.diff` preview. */
+class ApplyPreviewProvider implements vscode.TextDocumentContentProvider {
+    public static readonly scheme = 'nrgbot-preview';
+    private content = '';
+    private readonly _onDidChange = new vscode.EventEmitter<vscode.Uri>();
+    public readonly onDidChange = this._onDidChange.event;
+
+    public setContent(text: string): void {
+        this.content = text;
+    }
+
+    public provideTextDocumentContent(): string {
+        return this.content;
+    }
+
+    public refresh(uri: vscode.Uri): void {
+        this._onDidChange.fire(uri);
+    }
 }
 
 class OllamaViewProvider implements vscode.WebviewViewProvider {
@@ -22,7 +44,10 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
     private activeRequest: http.ClientRequest | undefined;
     private streamAborted = false;
 
-    constructor(private readonly extensionUri: vscode.Uri) {}
+    constructor(
+        private readonly extensionUri: vscode.Uri,
+        private readonly previewProvider: ApplyPreviewProvider
+    ) {}
 
     public resolveWebviewView(webviewView: vscode.WebviewView) {
         const mediaRoot = vscode.Uri.joinPath(this.extensionUri, 'media');
@@ -61,6 +86,7 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         .ai.pending { opacity: 0.7; animation: nrgbot-pulse 1.2s ease-in-out infinite; }
         @keyframes nrgbot-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
         .tool-note { font-size: 0.8em; opacity: 0.75; font-family: var(--vscode-editor-font-family, monospace); margin: 2px 0; }
+        .stream-status.failed { margin-top: 6px; padding: 4px 6px; border-radius: 3px; font-size: 0.85em; color: var(--vscode-inputValidation-warningForeground, var(--vscode-editor-foreground)); background: var(--vscode-inputValidation-warningBackground, rgba(181, 137, 0, 0.15)); border: 1px solid var(--vscode-inputValidation-warningBorder, #b58900); }
         
         /* Fixed bottom tray container formatting profiles */
         .bottom-tray { display: flex; flex-direction: column; width: 100%; }
@@ -69,14 +95,35 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         button:hover { background: var(--vscode-button-hoverBackground); }
         #send-btn.stop-mode { background: var(--vscode-inputValidation-warningBackground, #b58900); }
         .btn-group { display: flex; gap: 5px; margin-bottom: 5px; }
-        .top-bar { display: flex; justify-content: flex-end; margin-bottom: 5px; }
+        .top-bar { display: flex; justify-content: flex-end; gap: 5px; margin-bottom: 5px; }
         .top-bar button { width: auto; margin: 0; padding: 2px 8px; font-size: 0.8em; }
+        .settings-panel { border: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); padding: 8px; margin-bottom: 8px; border-radius: 4px; }
+        .settings-label { display: block; font-size: 0.75em; opacity: 0.8; margin: 4px 0 2px; text-transform: uppercase; letter-spacing: 0.03em; }
+        .settings-row { display: flex; gap: 4px; align-items: center; }
+        .settings-row input, .settings-row select { flex: 1; min-width: 0; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 3px 4px; box-sizing: border-box; font-size: 0.85em; }
+        .settings-row button { width: auto; margin: 0; padding: 3px 8px; font-size: 0.85em; flex: 0 0 auto; }
+        .settings-status { font-size: 0.75em; margin-top: 5px; min-height: 1em; opacity: 0.85; }
+        .settings-status.error { color: var(--vscode-inputValidation-warningForeground, #b58900); }
     </style>
 </head>
 <body>
     <!-- The conversation thread element stays pinned natively on top -->
     <div class="top-bar">
+        <button id="settings-btn">⚙️ Settings</button>
         <button id="clear-btn">🗑️ New Chat</button>
+    </div>
+    <div id="settings-panel" class="settings-panel" style="display:none;">
+        <label class="settings-label" for="server-url">Server URL</label>
+        <div class="settings-row">
+            <input id="server-url" type="text" placeholder="http://localhost:11434" />
+            <button id="connect-btn" title="Connect &amp; refresh models">🔌 Connect</button>
+        </div>
+        <label class="settings-label" for="model-select">Model</label>
+        <div class="settings-row">
+            <select id="model-select"></select>
+            <button id="refresh-models-btn" title="Refresh model list">↻</button>
+        </div>
+        <div id="settings-status" class="settings-status"></div>
     </div>
     <div id="chat-box"></div>
 
@@ -127,35 +174,152 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                     vscode.window.showWarningMessage('NRGBot: No editor found to grab the page from.');
                 }
             } else if (data.type === 'applyCode') {
-                const ed = this.lastActiveEditor ?? vscode.window.activeTextEditor;
-                if (!ed) {
-                    vscode.window.showWarningMessage('No active editor to apply changes to.');
-                    return;
+                await this._applyCodeWithPreview(data.value);
+            } else if (data.type === 'getModels') {
+                await this._sendModelList(webviewView.webview);
+            } else if (data.type === 'setModel') {
+                if (typeof data.value === 'string' && data.value) {
+                    await vscode.workspace.getConfiguration('nrgbot')
+                        .update('modelName', data.value, vscode.ConfigurationTarget.Global);
                 }
-                const fileName = ed.document.fileName.split(/[\\/]/).pop();
-                const hasSelection = !ed.selection.isEmpty;
-                const options: string[] = hasSelection
-                    ? ['Replace Selection', 'Insert at Cursor', 'Replace Entire File']
-                    : ['Insert at Cursor', 'Replace Entire File'];
-                const choice = await vscode.window.showQuickPick(options, {
-                    title: `Apply code to ${fileName}`,
-                    placeHolder: 'Choose how to apply this code'
-                });
-                if (!choice) return;
-
-                if (choice === 'Replace Entire File') {
-                    const fullRange = new vscode.Range(
-                        ed.document.positionAt(0),
-                        ed.document.positionAt(ed.document.getText().length)
-                    );
-                    await ed.edit(editBuilder => editBuilder.replace(fullRange, data.value));
-                } else if (choice === 'Replace Selection') {
-                    await ed.edit(editBuilder => editBuilder.replace(ed.selection, data.value));
-                } else {
-                    await ed.edit(editBuilder => editBuilder.insert(ed.selection.active, data.value));
+            } else if (data.type === 'setServerUrl') {
+                if (typeof data.value === 'string' && data.value.trim()) {
+                    await vscode.workspace.getConfiguration('nrgbot')
+                        .update('serverUrl', data.value.trim(), vscode.ConfigurationTarget.Global);
+                    await this._sendModelList(webviewView.webview);
                 }
             }
         });
+    }
+
+    private async _sendModelList(webview: vscode.Webview): Promise<void> {
+        const config = vscode.workspace.getConfiguration('nrgbot');
+        const serverUrl = config.get<string>('serverUrl') || 'http://192.168.3.142:11434';
+        const current = config.get<string>('modelName') || '';
+        const result = await this._fetchModels(serverUrl);
+        webview.postMessage({
+            type: 'models',
+            models: result.models,
+            current,
+            serverUrl,
+            error: result.error
+        });
+    }
+
+    private _fetchModels(serverUrl: string): Promise<{ models: string[]; error?: string }> {
+        return new Promise((resolve) => {
+            let parsedUrl: URL;
+            try {
+                parsedUrl = new URL(serverUrl);
+            } catch {
+                resolve({ models: [], error: 'Invalid server URL.' });
+                return;
+            }
+
+            const isHttps = parsedUrl.protocol === 'https:';
+            const transport = isHttps ? https : http;
+            const options = {
+                hostname: parsedUrl.hostname,
+                port: parsedUrl.port || (isHttps ? 443 : 80),
+                path: '/api/tags',
+                method: 'GET'
+            };
+
+            const req = transport.request(options, (res) => {
+                let body = '';
+                res.on('data', chunk => { body += chunk.toString(); });
+                res.on('end', () => {
+                    if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+                        resolve({ models: [], error: this._describeHttpError(res.statusCode, res.statusMessage, body) });
+                        return;
+                    }
+                    try {
+                        const parsed = JSON.parse(body);
+                        const models = Array.isArray(parsed?.models)
+                            ? parsed.models
+                                .map((m: { name?: string }) => m?.name)
+                                .filter((n: unknown): n is string => typeof n === 'string')
+                            : [];
+                        resolve({ models });
+                    } catch {
+                        resolve({ models: [], error: 'Could not parse the model list from the server.' });
+                    }
+                });
+            });
+            req.on('error', (e) => {
+                resolve({ models: [], error: this._describeConnectionError(e as NodeJS.ErrnoException, serverUrl) });
+            });
+            req.setTimeout(5000, () => {
+                req.destroy();
+                resolve({ models: [], error: 'The server did not respond in time.' });
+            });
+            req.end();
+        });
+    }
+
+    private async _applyCodeWithPreview(code: string): Promise<void> {
+        const ed = this.lastActiveEditor ?? vscode.window.activeTextEditor;
+        if (!ed) {
+            vscode.window.showWarningMessage('No active editor to apply changes to.');
+            return;
+        }
+
+        const fileName = ed.document.fileName.split(/[\\/]/).pop() || 'file';
+        const hasSelection = !ed.selection.isEmpty;
+        const options: string[] = hasSelection
+            ? ['Replace Selection', 'Insert at Cursor', 'Replace Entire File']
+            : ['Insert at Cursor', 'Replace Entire File'];
+        const choice = await vscode.window.showQuickPick(options, {
+            title: `Apply code to ${fileName}`,
+            placeHolder: 'Choose how to apply this code'
+        });
+        if (!choice) return;
+
+        // Snapshot the document and build both the proposed full text (for the diff)
+        // and a WorkspaceEdit (applied only on confirm, so focus can move to the diff).
+        const targetUri = ed.document.uri;
+        const original = ed.document.getText();
+        const edit = new vscode.WorkspaceEdit();
+        let proposed: string;
+
+        if (choice === 'Replace Entire File') {
+            proposed = code;
+            const fullRange = new vscode.Range(
+                ed.document.positionAt(0),
+                ed.document.positionAt(original.length)
+            );
+            edit.replace(targetUri, fullRange, code);
+        } else if (choice === 'Replace Selection') {
+            const start = ed.document.offsetAt(ed.selection.start);
+            const end = ed.document.offsetAt(ed.selection.end);
+            proposed = original.slice(0, start) + code + original.slice(end);
+            edit.replace(targetUri, new vscode.Range(ed.selection.start, ed.selection.end), code);
+        } else {
+            const offset = ed.document.offsetAt(ed.selection.active);
+            proposed = original.slice(0, offset) + code + original.slice(offset);
+            edit.insert(targetUri, ed.selection.active, code);
+        }
+
+        // Preview the result as a diff against the current file.
+        this.previewProvider.setContent(proposed);
+        const previewUri = vscode.Uri.from({ scheme: ApplyPreviewProvider.scheme, path: `/Proposed ${fileName}` });
+        this.previewProvider.refresh(previewUri);
+        await vscode.commands.executeCommand(
+            'vscode.diff',
+            targetUri,
+            previewUri,
+            `${fileName} \u2194 Proposed (${choice})`,
+            { preview: true }
+        );
+
+        const confirm = await vscode.window.showInformationMessage(
+            `Review the diff, then apply "${choice}" to ${fileName}?`,
+            'Apply',
+            'Cancel'
+        );
+        if (confirm === 'Apply') {
+            await vscode.workspace.applyEdit(edit);
+        }
     }
 
     private async _confirmAttachmentSize(text: string, label: string): Promise<string | undefined> {
@@ -280,14 +444,21 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             let content = '';
             const toolCallAccum = new Map<number, { id: string; name: string; arguments: string }>();
 
+            let settled = false;
+            const finish = (value: { content: string; toolCalls: { id: string; name: string; arguments: string }[] } | null) => {
+                if (settled) return;
+                settled = true;
+                this.activeRequest = undefined;
+                resolve(value);
+            };
+
             const req = transport.request(options, (res) => {
                 if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
                     let errorBody = '';
                     res.on('data', chunk => { errorBody += chunk.toString(); });
                     res.on('end', () => {
-                        this.activeRequest = undefined;
                         webview.postMessage({ type: 'error', value: this._describeHttpError(res.statusCode, res.statusMessage, errorBody) });
-                        resolve(null);
+                        finish(null);
                     });
                     return;
                 }
@@ -355,7 +526,6 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                     }
                 });
                 res.on('end', () => {
-                    this.activeRequest = undefined;
                     if (!jsonPrefixDecided && displayBuffer) {
                         // Never resolved into a full tool-call JSON blob (e.g. truncated); show it rather than dropping it.
                         webview.postMessage({ type: 'token', value: displayBuffer });
@@ -372,20 +542,41 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                             content = leading.rest;
                         }
                     }
-                    resolve({ content, toolCalls });
+                    finish({ content, toolCalls });
                 });
+
+                // A socket drop after headers emits 'aborted'/'error'/'close' but never 'end',
+                // which would otherwise leave the request hung and the chat stuck "pending".
+                const handleMidStreamDrop = (err?: Error) => {
+                    if (settled) return;
+                    if (this.streamAborted) { finish(null); return; }
+                    if (!jsonPrefixDecided && displayBuffer) {
+                        webview.postMessage({ type: 'token', value: displayBuffer });
+                        displayBuffer = '';
+                    }
+                    const detail = err
+                        ? this._describeConnectionError(err as NodeJS.ErrnoException, configuredUrl)
+                        : 'The connection closed before the response finished.';
+                    webview.postMessage({ type: 'streamError', value: detail });
+                    finish(null);
+                };
+                res.on('aborted', () => handleMidStreamDrop());
+                res.on('error', (err) => handleMidStreamDrop(err));
+                res.on('close', () => handleMidStreamDrop());
             });
 
             req.on('error', (e) => {
-                this.activeRequest = undefined;
                 if (this.streamAborted) {
-                    resolve(null);
+                    finish(null);
                     return;
                 }
                 const friendly = this._describeConnectionError(e, configuredUrl);
-                webview.postMessage({ type: 'error', value: friendly });
-                vscode.window.showErrorMessage('NRGBot Connection Failure: ' + friendly);
-                resolve(null);
+                // If tokens already streamed, treat it as a recoverable mid-stream drop rather than a hard error.
+                webview.postMessage({ type: content.length > 0 ? 'streamError' : 'error', value: friendly });
+                if (content.length === 0) {
+                    vscode.window.showErrorMessage('NRGBot Connection Failure: ' + friendly);
+                }
+                finish(null);
             });
 
             this.activeRequest = req;

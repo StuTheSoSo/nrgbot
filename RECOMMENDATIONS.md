@@ -27,16 +27,23 @@ Every bug so far lived in string/stream parsing. Make these pure and testable.
 Local models routinely emit malformed tool calls, invented tools, echoed attachments,
 and truncated fences.
 
-- [ ] Centralize model-output sanitization so fixes live in one place.
-- [ ] Ensure unknown tool calls never render in chat and return a corrective tool result
-      (already implemented — add a regression test).
+- [x] Centralize model-output sanitization so fixes live in one place
+      (`isKnownTool` / `unknownToolResult` in `src/tools.ts`; `executeTool` returns the
+      corrective message for unknown tools).
+- [x] Ensure unknown tool calls never render in chat and return a corrective tool result
+      (regression tests in `src/test/tools.test.ts`).
 
 ### 1.3 Recoverable state on dropped/mid-stream failures
 Remote Ollama over LAN will drop connections.
 
-- [ ] Ensure a dropped stream mid-response leaves the chat in a recoverable state
-      (no half-rendered "pending" bubble).
-- [ ] Surface a visible "reconnecting / failed" indicator in the webview.
+- [x] Ensure a dropped stream mid-response leaves the chat in a recoverable state
+      (no half-rendered "pending" bubble). The completion promise now settles exactly once
+      via a `finish()` guard, and `res` `aborted`/`error`/`close` handlers catch socket
+      drops after headers so the request can no longer hang.
+- [x] Surface a visible "failed" indicator in the webview. On a mid-stream drop the
+      partial response is preserved (kept in the transcript) and a `.stream-status.failed`
+      note is appended. Note: a streamed completion cannot be resumed, so this is a clear
+      failed indicator rather than a fake "reconnecting" state.
 
 ---
 
@@ -48,13 +55,22 @@ Remote Ollama over LAN will drop connections.
 - [ ] Consider lightweight session history (list of past chats).
 
 ### 2.2 Model / server switching from the UI
-- [ ] Add a model dropdown in the webview (config is already read in the provider).
-- [ ] Allow switching `serverUrl` without hand-editing settings JSON.
+- [x] Add a model dropdown in the webview (config is already read in the provider).
+      A ⚙️ Settings panel now shows a model `<select>` populated live from the server's
+      `/api/tags` endpoint (proxied through the extension since the webview has no network
+      access); picking one persists `nrgbot.modelName`.
+- [x] Allow switching `serverUrl` without hand-editing settings JSON. The settings panel
+      has a Server URL field + Connect button that persists `nrgbot.serverUrl` and
+      re-fetches the model list, with inline status/error feedback.
 
 ### 2.3 Diff-based apply
-- [ ] Replace blind "Replace Entire File" with a preview diff (`vscode.diff`) before
-      applying model-generated code.
-- [ ] Keep "Insert at Cursor" / "Replace Selection" but show a confirmation/diff.
+- [x] Replace blind "Replace Entire File" with a preview diff (`vscode.diff`) before
+      applying model-generated code. A virtual `nrgbot-preview:` document holds the
+      proposed post-apply text and is diffed against the real file.
+- [x] Keep "Insert at Cursor" / "Replace Selection" but show a confirmation/diff. All
+      three modes now open the same diff preview and gate the edit behind an
+      Apply/Cancel prompt; the edit is applied via `WorkspaceEdit` so it works even
+      after focus moves to the diff editor.
 
 ### 2.4 Token / context budget indicator
 - [ ] Show a running character/token estimate (there is already `MAX_ATTACHMENT_CHARS`)
