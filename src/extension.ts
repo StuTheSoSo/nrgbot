@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as http from 'http';
 import * as https from 'https';
+import { TOOLS, executeTool } from './tools';
 
 export function activate(context: vscode.ExtensionContext) {
     const provider = new OllamaViewProvider(context.extensionUri);
@@ -58,6 +59,7 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         .code-actions button { width: auto; margin: 0; padding: 2px 8px; font-size: 0.8em; }
         .ai.pending { opacity: 0.7; animation: nrgbot-pulse 1.2s ease-in-out infinite; }
         @keyframes nrgbot-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+        .tool-note { font-size: 0.8em; opacity: 0.75; font-family: var(--vscode-editor-font-family, monospace); margin: 2px 0; }
         
         /* Fixed bottom tray container formatting profiles */
         .bottom-tray { display: flex; flex-direction: column; width: 100%; }
@@ -104,10 +106,10 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             } else if (data.type === 'grabText') {
                 const ed = this.lastActiveEditor ?? vscode.window.activeTextEditor;
                 if (ed) {
-                    const fileName = ed.document.fileName.split(/[\\/]/).pop();
+                    const fileName = vscode.workspace.asRelativePath(ed.document.uri);
                     const content = await this._confirmAttachmentSize(ed.document.getText(ed.selection), 'Selection');
                     if (content !== undefined) {
-                        webviewView.webview.postMessage({ type: 'attach', label: `✨ ${fileName} (selection)`, value: content });
+                        webviewView.webview.postMessage({ type: 'attach', label: `✨ ${fileName} (selection)`, fileName, value: content });
                     }
                 } else {
                     vscode.window.showWarningMessage('NRGBot: No editor found to grab text from.');
@@ -115,10 +117,10 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             } else if (data.type === 'grabPage') {
                 const ed = this.lastActiveEditor ?? vscode.window.activeTextEditor;
                 if (ed) {
-                    const fileName = ed.document.fileName.split(/[\\/]/).pop();
+                    const fileName = vscode.workspace.asRelativePath(ed.document.uri);
                     const content = await this._confirmAttachmentSize(ed.document.getText(), 'Full page');
                     if (content !== undefined) {
-                        webviewView.webview.postMessage({ type: 'attach', label: `📄 ${fileName}`, value: content });
+                        webviewView.webview.postMessage({ type: 'attach', label: `📄 ${fileName}`, fileName, value: content });
                     }
                 } else {
                     vscode.window.showWarningMessage('NRGBot: No editor found to grab the page from.');
@@ -173,89 +175,306 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         return text;
     }
 
-    private _streamFromOllama(messages: { role: string; content: string }[], webview: vscode.Webview) {
-        if (this.activeRequest) {
-            vscode.window.showWarningMessage('NRGBot: A response is already in progress.');
+    private static readonly MAX_AGENT_ITERATIONS = 6;
+
+    private async _streamFromOllama(
+        messages: { role: string; content: string | null; tool_calls?: unknown[]; tool_call_id?: string }[],
+        webview: vscode.Webview,
+        depth = 0
+    ): Promise<void> {
+        if (depth >= OllamaViewProvider.MAX_AGENT_ITERATIONS) {
+            webview.postMessage({ type: 'error', value: 'Stopped: too many tool-call iterations.' });
             return;
         }
 
         const config = vscode.workspace.getConfiguration('nrgbot');
-        const configuredUrl = config.get<string>('serverUrl') || 'http://192.168.3.142:11434';
-        const modelName = config.get<string>('modelName') || 'qwen2.5-coder:7b';
-        
-        let parsedUrl: URL;
-        try {
-            parsedUrl = new URL(configuredUrl);
-        } catch (err) {
-            parsedUrl = new URL('http://192.168.3.142:11434');
+        const toolsEnabled = config.get<boolean>('enableTools') ?? true;
+
+        const result = await this._postChatCompletion(messages, webview, toolsEnabled);
+        if (!result) return; // error or abort already reported
+
+        if (result.toolCalls.length === 0) {
+            webview.postMessage({ type: 'done' });
+            return;
         }
 
-        const isHttps = parsedUrl.protocol === 'https:';
-        const transport = isHttps ? https : http;
+        const nextMessages = [...messages, {
+            role: 'assistant',
+            content: result.content || null,
+            tool_calls: result.toolCalls.map(tc => ({
+                id: tc.id,
+                type: 'function',
+                function: { name: tc.name, arguments: tc.arguments }
+            }))
+        }];
 
-        const postData = JSON.stringify({
-            model: modelName,
-            messages,
-            stream: true
-        });
-
-        const options = {
-            hostname: parsedUrl.hostname,
-            port: parsedUrl.port || (isHttps ? 443 : 80),
-            path: '/v1/chat/completions',
-            method: 'POST',
-            headers: { 
-                'Content-Type': 'application/json', 
-                'Content-Length': Buffer.byteLength(postData) 
+        for (const tc of result.toolCalls) {
+            let args: Record<string, unknown> = {};
+            try {
+                args = tc.arguments ? JSON.parse(tc.arguments) : {};
+            } catch {
+                // Malformed arguments JSON from the model; execute with empty args, tool reports its own error.
             }
-        };
+            const supportedTool = TOOLS.some(tool => tool.function.name === tc.name);
+            if (supportedTool) {
+                webview.postMessage({ type: 'toolCall', name: tc.name, args: tc.arguments });
+            }
+            const toolResult = supportedTool
+                ? await executeTool(tc.name, args)
+                : `The ${tc.name} tool is unavailable. Do not invent tools. Answer the user's request directly using any attached file content.`;
+            nextMessages.push({ role: 'tool', tool_call_id: tc.id, content: toolResult });
+        }
 
-        this.streamAborted = false;
-        const req = transport.request(options, (res) => {
-            if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-                let errorBody = '';
-                res.on('data', chunk => { errorBody += chunk.toString(); });
-                res.on('end', () => {
-                    this.activeRequest = undefined;
-                    webview.postMessage({ type: 'error', value: `HTTP ${res.statusCode}: ${errorBody.slice(0, 300) || res.statusMessage}` });
-                });
+        await this._streamFromOllama(nextMessages, webview, depth + 1);
+    }
+
+    private _postChatCompletion(
+        messages: { role: string; content: string | null; tool_calls?: unknown[]; tool_call_id?: string }[],
+        webview: vscode.Webview,
+        toolsEnabled: boolean
+    ): Promise<{ content: string; toolCalls: { id: string; name: string; arguments: string }[] } | null> {
+        return new Promise((resolve) => {
+            if (this.activeRequest) {
+                vscode.window.showWarningMessage('NRGBot: A response is already in progress.');
+                resolve(null);
                 return;
             }
 
-            let buffer = '';
-            res.on('data', (chunk) => {
-                buffer += chunk.toString();
-                const lines = buffer.split('\n');
-                buffer = lines.pop() || '';
-                for (const line of lines) {
-                    if (line.trim().startsWith('data: ')) {
-                        try {
-                            const json = JSON.parse(line.trim().substring(6));
-                            if (json.choices && json.choices[0] && json.choices[0].delta) {
-                                const content = json.choices[0].delta.content || '';
-                                if (content) webview.postMessage({ type: 'token', value: content });
+            const config = vscode.workspace.getConfiguration('nrgbot');
+            const configuredUrl = config.get<string>('serverUrl') || 'http://192.168.3.142:11434';
+            const modelName = config.get<string>('modelName') || 'qwen2.5-coder:7b';
+
+            let parsedUrl: URL;
+            try {
+                parsedUrl = new URL(configuredUrl);
+            } catch (err) {
+                parsedUrl = new URL('http://192.168.3.142:11434');
+            }
+
+            const isHttps = parsedUrl.protocol === 'https:';
+            const transport = isHttps ? https : http;
+
+            const systemMessage = {
+                role: 'system',
+                content: 'You are a coding assistant inside VS Code. The user\'s message may already include attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>". That attached content IS the file the user is referring to; treat it as fully available and answer from it directly. Never call read_file or list_directory for a file whose content is already attached, and never claim an attached file does not exist. Do not echo or quote the complete attached file unless the user explicitly asks for it. Never write JSON tool calls in your response. Only call tools supplied in this request; never invent a tool such as analyze_code_quality. Analyze attached code directly in your normal response.'
+            };
+            const postData = JSON.stringify({
+                model: modelName,
+                messages: [systemMessage, ...messages],
+                stream: true,
+                ...(toolsEnabled ? { tools: TOOLS } : {})
+            });
+
+            const options = {
+                hostname: parsedUrl.hostname,
+                port: parsedUrl.port || (isHttps ? 443 : 80),
+                path: '/v1/chat/completions',
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(postData)
+                }
+            };
+
+            this.streamAborted = false;
+            let content = '';
+            const toolCallAccum = new Map<number, { id: string; name: string; arguments: string }>();
+
+            const req = transport.request(options, (res) => {
+                if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+                    let errorBody = '';
+                    res.on('data', chunk => { errorBody += chunk.toString(); });
+                    res.on('end', () => {
+                        this.activeRequest = undefined;
+                        webview.postMessage({ type: 'error', value: this._describeHttpError(res.statusCode, res.statusMessage, errorBody) });
+                        resolve(null);
+                    });
+                    return;
+                }
+
+                let buffer = '';
+                let displayBuffer = '';
+                let jsonPrefixDecided = false;
+                const MAX_JSON_PROBE_CHARS = 4000;
+                res.on('data', (chunk) => {
+                    buffer += chunk.toString();
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+                    for (const line of lines) {
+                        if (line.trim().startsWith('data: ')) {
+                            const payload = line.trim().substring(6);
+                            if (payload === '[DONE]') continue;
+                            try {
+                                const json = JSON.parse(payload);
+                                const delta = json.choices?.[0]?.delta;
+                                if (delta?.content) {
+                                    content += delta.content;
+                                    if (jsonPrefixDecided) {
+                                        webview.postMessage({ type: 'token', value: delta.content });
+                                    } else {
+                                        displayBuffer += delta.content;
+                                        const probe = displayBuffer.replace(/^\s+/, '');
+                                        const looksLikeToolCallStart = probe.length === 0
+                                            || probe.startsWith('{')
+                                            || '<tool_call>'.startsWith(probe.slice(0, 11))
+                                            || '```json'.startsWith(probe.slice(0, 7))
+                                            || probe === '`' || probe === '``';
+                                        if (!looksLikeToolCallStart) {
+                                            jsonPrefixDecided = true;
+                                            webview.postMessage({ type: 'token', value: displayBuffer });
+                                            displayBuffer = '';
+                                        } else {
+                                            const leading = this._extractLeadingToolCallJson(displayBuffer);
+                                            if (leading) {
+                                                jsonPrefixDecided = true;
+                                                if (leading.rest) webview.postMessage({ type: 'token', value: leading.rest });
+                                                displayBuffer = '';
+                                            } else if (displayBuffer.length > MAX_JSON_PROBE_CHARS) {
+                                                // Gave up waiting for a closing brace; show it rather than hide real content forever.
+                                                jsonPrefixDecided = true;
+                                                webview.postMessage({ type: 'token', value: displayBuffer });
+                                                displayBuffer = '';
+                                            }
+                                        }
+                                    }
+                                }
+                                if (delta?.tool_calls) {
+                                    for (const tc of delta.tool_calls) {
+                                        const idx = tc.index ?? 0;
+                                        const acc = toolCallAccum.get(idx) ?? { id: '', name: '', arguments: '' };
+                                        if (tc.id) acc.id = tc.id;
+                                        if (tc.function?.name) acc.name += tc.function.name;
+                                        if (tc.function?.arguments) acc.arguments += tc.function.arguments;
+                                        toolCallAccum.set(idx, acc);
+                                    }
+                                }
+                            } catch (e) {
+                                console.error('[NRGBot] Failed to parse SSE line:', line, e);
                             }
-                        } catch (e) {
-                            console.error('[NRGBot] Failed to parse SSE line:', line, e);
                         }
                     }
-                }
+                });
+                res.on('end', () => {
+                    this.activeRequest = undefined;
+                    if (!jsonPrefixDecided && displayBuffer) {
+                        // Never resolved into a full tool-call JSON blob (e.g. truncated); show it rather than dropping it.
+                        webview.postMessage({ type: 'token', value: displayBuffer });
+                    }
+                    let toolCalls = [...toolCallAccum.values()].filter(tc => tc.name);
+                    // Some models write a tool call as plain JSON text (sometimes followed by their real answer)
+                    // instead of using the tool_calls delta, or echo the call back before/alongside their answer.
+                    const leading = this._extractLeadingToolCallJson(content);
+                    if (leading) {
+                        if (toolCalls.length === 0 && leading.rest.trim() === '') {
+                            toolCalls = [{ id: `fallback-${Date.now()}`, name: leading.name, arguments: leading.arguments }];
+                            content = '';
+                        } else {
+                            content = leading.rest;
+                        }
+                    }
+                    resolve({ content, toolCalls });
+                });
             });
-            res.on('end', () => {
+
+            req.on('error', (e) => {
                 this.activeRequest = undefined;
-                webview.postMessage({ type: 'done' });
+                if (this.streamAborted) {
+                    resolve(null);
+                    return;
+                }
+                const friendly = this._describeConnectionError(e, configuredUrl);
+                webview.postMessage({ type: 'error', value: friendly });
+                vscode.window.showErrorMessage('NRGBot Connection Failure: ' + friendly);
+                resolve(null);
             });
+
+            this.activeRequest = req;
+            req.write(postData);
+            req.end();
         });
-        
-        req.on('error', (e) => { 
-            this.activeRequest = undefined;
-            if (this.streamAborted) return;
-            webview.postMessage({ type: 'error', value: e.message }); 
-            vscode.window.showErrorMessage('NRGBot Connection Failure: ' + e.message);
-        });
-        
-        this.activeRequest = req;
-        req.write(postData);
-        req.end();
+    }
+
+    /** Turns a non-2xx HTTP response into a short, actionable message instead of a raw status/body dump. */
+    private _describeHttpError(statusCode: number | undefined, statusMessage: string | undefined, body: string): string {
+        try {
+            const parsed = JSON.parse(body);
+            if (typeof parsed?.error === 'string') return parsed.error;
+            if (typeof parsed?.error?.message === 'string') return parsed.error.message;
+        } catch {
+            // Body wasn't JSON; fall through to a generic message.
+        }
+        if (statusCode === 404) return `Model or endpoint not found (HTTP 404). Check the model name and server URL in NRGBot settings.`;
+        if (statusCode === 401 || statusCode === 403) return `The server rejected the request (HTTP ${statusCode}). Check any required authentication.`;
+        if (statusCode && statusCode >= 500) return `The Ollama server had an internal error (HTTP ${statusCode}). Check the server logs.`;
+        return `HTTP ${statusCode}: ${body.slice(0, 300) || statusMessage || 'Unknown error'}`;
+    }
+
+    /** Maps common Node network error codes to plain-language explanations. */
+    private _describeConnectionError(e: NodeJS.ErrnoException, url: string): string {
+        switch (e.code) {
+            case 'ECONNREFUSED': return `Could not connect to the Ollama server at ${url}. Make sure it's running and reachable.`;
+            case 'ENOTFOUND': return `Could not resolve the host in ${url}. Check the server URL in NRGBot settings.`;
+            case 'ETIMEDOUT': return `Connection to ${url} timed out. The server may be unreachable or overloaded.`;
+            case 'ECONNRESET': return `The connection to ${url} was reset while waiting for a response.`;
+            default: return e.message;
+        }
+    }
+
+    /**
+     * Looks for a tool call a model wrote as plain JSON text at the start of its content (optionally
+     * wrapped in <tool_call> tags or a ```json fence), instead of using the proper tool_calls delta.
+     * Returns the parsed call plus whatever text follows it, so leaked/echoed JSON can be stripped
+     * even when real prose follows.
+     */
+    private _extractLeadingToolCallJson(content: string): { name: string; arguments: string; rest: string } | null {
+        let rest = content.replace(/^\s+/, '');
+        const tagMatch = rest.match(/^<tool_call>\s*/i);
+        if (tagMatch) rest = rest.slice(tagMatch[0].length);
+        const fenceMatch = rest.match(/^```(?:json)?\s*/i);
+        if (fenceMatch) rest = rest.slice(fenceMatch[0].length);
+        if (!rest.startsWith('{')) return null;
+
+        let depth = 0;
+        let inString = false;
+        let escape = false;
+        let endIdx = -1;
+        for (let i = 0; i < rest.length; i++) {
+            const ch = rest[i];
+            if (inString) {
+                if (escape) escape = false;
+                else if (ch === '\\') escape = true;
+                else if (ch === '"') inString = false;
+                continue;
+            }
+            if (ch === '"') { inString = true; continue; }
+            if (ch === '{') depth++;
+            else if (ch === '}') {
+                depth--;
+                if (depth === 0) { endIdx = i; break; }
+            }
+        }
+        if (endIdx === -1) return null;
+
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(rest.slice(0, endIdx + 1));
+        } catch {
+            return null;
+        }
+
+        const name = (parsed as { name?: unknown })?.name;
+        const args = (parsed as { arguments?: unknown })?.arguments;
+    if (typeof name !== 'string') return null;
+
+        let remainder = rest.slice(endIdx + 1);
+        remainder = remainder.replace(/^\s*<\/tool_call>/i, '');
+        remainder = remainder.replace(/^\s*```/, '');
+        remainder = remainder.replace(/^\s+/, '');
+
+        return {
+            name,
+            arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}),
+            rest: remainder
+        };
     }
 }

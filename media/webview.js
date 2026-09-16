@@ -5,6 +5,8 @@
     const attachmentsEl = document.getElementById('attachments');
     const sendBtn = document.getElementById('send-btn');
     let currentAi = null;
+    let currentAiContent = null;
+    let currentToolLog = null;
     let currentAiRaw = '';
     let attachments = [];
     let conversation = [];
@@ -99,8 +101,28 @@
     }
 
     function stripFences(raw) {
-        const m = raw.trim().match(/^```[a-zA-Z]*\n([\s\S]*?)\n?```$/);
-        return m ? m[1] : raw;
+        const lines = raw.trim().split('\n');
+        if (!/^```[a-zA-Z0-9]*\s*$/.test(lines[0])) return raw.trim();
+        lines.shift();
+        // Drop trailing blank lines and any (possibly duplicated) closing fence lines.
+        while (lines.length) {
+            const last = lines[lines.length - 1].trim();
+            if (last === '' || last === '```') {
+                lines.pop();
+                continue;
+            }
+            break;
+        }
+        return lines.join('\n').trimEnd();
+    }
+
+    function getCodeBlocks(raw) {
+        const blocks = [];
+        raw.replace(/```[^\n]*\n([\s\S]*?)```/g, (match, code) => {
+            blocks.push(code.replace(/\n$/, ''));
+            return match;
+        });
+        return blocks;
     }
 
     function renderAttachments() {
@@ -123,10 +145,10 @@
             if (currentAi) {
                 currentAi.classList.remove('pending');
                 if (!currentAiRaw) {
-                    currentAi.innerText = 'Stopped.';
+                    currentAiContent.innerText = 'Stopped.';
                     conversation.pop();
                 } else {
-                    currentAi.innerHTML = renderMarkdown(currentAiRaw);
+                    currentAiContent.innerHTML = renderMarkdown(currentAiRaw);
                 }
             }
             return;
@@ -137,14 +159,19 @@
 
         let fullPrompt = text;
         if (attachments.length) {
-            fullPrompt += '\n\n' + attachments.map(a => '```\n' + a.value + '\n```').join('\n\n');
+            fullPrompt += '\n\n' + attachments.map(a => 'Attached file: ' + (a.fileName || a.label) + '\n```\n' + a.value + '\n```').join('\n\n');
         }
 
         promptInput.value = '';
         currentAi = document.createElement('div');
         currentAi.className = 'msg ai pending';
+        currentToolLog = document.createElement('div');
+        currentToolLog.className = 'tool-log';
+        currentAiContent = document.createElement('div');
         currentAiRaw = '';
-        currentAi.innerText = 'Thinking...';
+        currentAiContent.innerText = 'Thinking...';
+        currentAi.appendChild(currentToolLog);
+        currentAi.appendChild(currentAiContent);
         chatBox.appendChild(currentAi);
         chatBox.scrollTop = chatBox.scrollHeight;
         conversation.push({ role: 'user', content: fullPrompt });
@@ -198,14 +225,21 @@
         if (msg.type === 'token') {
             currentAiRaw += msg.value;
             currentAi.classList.remove('pending');
-            currentAi.innerHTML = renderMarkdown(currentAiRaw);
+            currentAiContent.innerHTML = renderMarkdown(currentAiRaw);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        } else if (msg.type === 'toolCall') {
+            currentAi.classList.remove('pending');
+            const note = document.createElement('div');
+            note.className = 'tool-note';
+            note.textContent = '\uD83D\uDD27 ' + msg.name + '(' + (msg.args || '') + ')';
+            currentToolLog.appendChild(note);
             chatBox.scrollTop = chatBox.scrollHeight;
         } else if (msg.type === 'attach') {
-            attachments.push({ label: msg.label, value: msg.value });
+            attachments.push({ label: msg.label, fileName: msg.fileName, value: msg.value });
             renderAttachments();
         } else if (msg.type === 'error') {
             currentAi.classList.remove('pending');
-            currentAi.innerText = 'Error: ' + msg.value;
+            currentAiContent.innerText = 'Error: ' + msg.value;
             conversation.pop();
             setStreaming(false);
         } else if (msg.type === 'done') {
@@ -215,17 +249,20 @@
                 const footer = document.createElement('div');
                 footer.className = 'code-actions';
                 footer.style.marginTop = '6px';
-                const applyAllBtn = document.createElement('button');
-                applyAllBtn.textContent = '\uD83D\uDCDD Apply Full Response to Editor';
-                applyAllBtn.addEventListener('click', () => {
-                    vscode.postMessage({ type: 'applyCode', value: stripFences(currentAiRaw) });
-                });
+                const codeBlocks = getCodeBlocks(currentAiRaw);
+                if (codeBlocks.length === 1) {
+                    const applyAllBtn = document.createElement('button');
+                    applyAllBtn.textContent = '\uD83D\uDCDD Apply Code Block to Editor';
+                    applyAllBtn.addEventListener('click', () => {
+                        vscode.postMessage({ type: 'applyCode', value: codeBlocks[0] });
+                    });
+                    footer.appendChild(applyAllBtn);
+                }
                 const copyAllBtn = document.createElement('button');
                 copyAllBtn.textContent = '\uD83D\uDCCB Copy Full Response';
                 copyAllBtn.addEventListener('click', () => {
-                    navigator.clipboard.writeText(stripFences(currentAiRaw));
+                    navigator.clipboard.writeText(currentAiRaw);
                 });
-                footer.appendChild(applyAllBtn);
                 footer.appendChild(copyAllBtn);
                 currentAi.appendChild(footer);
             }

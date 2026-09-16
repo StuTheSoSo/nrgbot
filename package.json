@@ -46,6 +46,11 @@
           "type": "string",
           "default": "qwen2.5-coder:7b",
           "description": "The exact model name as it appears when running 'ollama list' on your remote machine."
+        },
+        "nrgbot.enableTools": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow the model to call read-only workspace tools (read file, list directory, search text). Requires a tool-calling-capable model."
         }
       }
     }
@@ -62,6 +67,10 @@
     "@types/mocha": "^10.0.10",
     "@types/node": "^26.6.0",
     "@types/vscode": "^1.90.0",
-    "typescript": "^7.0.2"
+    "@vscode/test-cli": "^0.0.10",
+    "@vscode/test-electron": "^2.4.1",
+    "eslint": "^9.19.0",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.22.0"
   }
 }
