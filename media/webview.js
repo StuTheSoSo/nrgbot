@@ -21,7 +21,9 @@
 
     function setStreaming(active) {
         isStreaming = active;
-        sendBtn.textContent = active ? '⏹ Stop' : 'Send to Remote Machine';
+        sendBtn.innerHTML = active
+            ? '<i class="codicon codicon-debug-stop"></i> Stop'
+            : '<i class="codicon codicon-send"></i> Send';
         sendBtn.classList.toggle('stop-mode', active);
     }
 
@@ -75,9 +77,12 @@
         const codeBlocks = [];
         let text = md.replace(/```(\w*)\n([\s\S]*?)```/g, (m, lang, code) => {
             codeBlocks.push(
-                '<div class="code-block"><div class="code-actions">' +
-                '<button class="apply-btn">\uD83D\uDCDD Apply to Editor</button>' +
-                '<button class="copy-btn">\uD83D\uDCCB Copy</button></div>' +
+                '<div class="code-block"><div class="code-head">' +
+                '<span class="code-lang">' + escapeHtml(lang || 'code') + '</span>' +
+                '<span class="code-head-actions">' +
+                '<button class="icon-btn apply-btn" title="Apply to editor"><i class="codicon codicon-diff"></i></button>' +
+                '<button class="icon-btn copy-btn" title="Copy"><i class="codicon codicon-copy"></i></button>' +
+                '</span></div>' +
                 '<pre><code>' + escapeHtml(code.replace(/\n$/, '')) + '</code></pre></div>'
             );
             return '\u0000' + (codeBlocks.length - 1) + '\u0000';
@@ -137,13 +142,123 @@
         attachmentsEl.innerHTML = '';
         attachments.forEach((att, i) => {
             const chip = document.createElement('span');
-            chip.style.cssText = 'background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);padding:2px 6px;border-radius:10px;font-size:0.85em;';
-            chip.textContent = '\uD83D\uDCCC ' + att.label + ' \u2715';
-            chip.title = 'Pinned to every message \u2014 click to detach';
-            chip.style.cursor = 'pointer';
-            chip.addEventListener('click', () => { attachments.splice(i, 1); renderAttachments(); });
+            chip.className = 'chip';
+            chip.title = att.label;
+            const icon = document.createElement('i');
+            icon.className = 'codicon codicon-file chip-icon';
+            const name = document.createElement('span');
+            name.className = 'chip-name';
+            name.textContent = att.label;
+            const close = document.createElement('span');
+            close.className = 'chip-close';
+            close.title = 'Detach';
+            close.innerHTML = '<i class="codicon codicon-close"></i>';
+            close.addEventListener('click', () => { attachments.splice(i, 1); renderAttachments(); saveState(); });
+            chip.appendChild(icon);
+            chip.appendChild(name);
+            chip.appendChild(close);
             attachmentsEl.appendChild(chip);
         });
+    }
+
+    // Persist the thread across window reloads (webview state is backed by VS Code storage).
+    function saveState() {
+        vscode.setState({ conversation, attachments });
+    }
+
+    function avatarHtml(role) {
+        const icon = role === 'ai' ? 'codicon-zap' : 'codicon-account';
+        return '<span class="msg-avatar"><i class="codicon ' + icon + '"></i></span>';
+    }
+
+    function typingHtml() {
+        return '<div class="typing"><span></span><span></span><span></span></div>';
+    }
+
+    function createUserRow(text) {
+        const row = document.createElement('div');
+        row.className = 'msg user';
+        row.innerHTML = avatarHtml('user') +
+            '<div class="msg-body"><div class="msg-author">You</div><div class="msg-content"></div></div>';
+        row.querySelector('.msg-content').textContent = text;
+        return row;
+    }
+
+    function createAiRow() {
+        const row = document.createElement('div');
+        row.className = 'msg ai pending';
+        row.innerHTML = avatarHtml('ai') +
+            '<div class="msg-body"><div class="msg-author">NRGBot</div>' +
+            '<div class="tool-log"></div><div class="msg-content"></div></div>';
+        return {
+            row: row,
+            body: row.querySelector('.msg-body'),
+            content: row.querySelector('.msg-content'),
+            toolLog: row.querySelector('.tool-log')
+        };
+    }
+
+    function buildAssistantFooter(raw) {
+        const footer = document.createElement('div');
+        footer.className = 'msg-footer';
+        const codeBlocks = getCodeBlocks(raw);
+        if (codeBlocks.length === 1) {
+            const applyBtn = document.createElement('button');
+            applyBtn.className = 'btn';
+            applyBtn.innerHTML = '<i class="codicon codicon-diff"></i> Apply';
+            applyBtn.addEventListener('click', () => {
+                vscode.postMessage({ type: 'applyCode', value: codeBlocks[0] });
+            });
+            footer.appendChild(applyBtn);
+        }
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'btn';
+        copyBtn.innerHTML = '<i class="codicon codicon-copy"></i> Copy';
+        copyBtn.addEventListener('click', () => {
+            navigator.clipboard.writeText(raw);
+        });
+        footer.appendChild(copyBtn);
+        return footer;
+    }
+
+    function renderEmptyState() {
+        const w = document.createElement('div');
+        w.className = 'welcome';
+        w.innerHTML =
+            '<div class="welcome-mark"><i class="codicon codicon-zap"></i></div>' +
+            '<h2>NRG<b>Bot</b></h2>' +
+            '<p>Your private code wizard, powered by remote Ollama.</p>' +
+            '<div class="welcome-hints">' +
+            '<div class="welcome-hint"><i class="codicon codicon-list-selection"></i><span>Attach a selection or full file as context</span></div>' +
+            '<div class="welcome-hint"><i class="codicon codicon-comment-discussion"></i><span>Ask questions or request code changes</span></div>' +
+            '<div class="welcome-hint"><i class="codicon codicon-diff"></i><span>Preview edits as a diff before applying</span></div>' +
+            '</div>';
+        chatBox.appendChild(w);
+    }
+
+    function removeWelcome() {
+        const w = chatBox.querySelector('.welcome');
+        if (w) w.remove();
+    }
+
+    function renderConversation() {
+        chatBox.innerHTML = '';
+        if (!conversation.length) {
+            renderEmptyState();
+            return;
+        }
+        conversation.forEach(m => {
+            if (m.role === 'user') {
+                chatBox.appendChild(createUserRow(m.display != null ? m.display : m.content));
+            } else if (m.role === 'assistant') {
+                const ai = createAiRow();
+                ai.row.classList.remove('pending');
+                ai.content.innerHTML = renderMarkdown(m.content);
+                ai.body.appendChild(buildAssistantFooter(m.content));
+                chatBox.appendChild(ai.row);
+            }
+        });
+        chatBox.scrollTop = chatBox.scrollHeight;
     }
 
     document.getElementById('send-btn').addEventListener('click', () => {
@@ -157,13 +272,16 @@
                     conversation.pop();
                 } else {
                     currentAiContent.innerHTML = renderMarkdown(currentAiRaw);
+                    conversation.push({ role: 'assistant', content: currentAiRaw });
                 }
             }
+            saveState();
             return;
         }
         const text = promptInput.value.trim();
         if (!text && attachments.length === 0) return;
-        chatBox.innerHTML += '<div class="msg user">' + escapeHtml(text) + '</div>';
+        removeWelcome();
+        chatBox.appendChild(createUserRow(text));
 
         let fullPrompt = text;
         if (attachments.length) {
@@ -171,20 +289,18 @@
         }
 
         promptInput.value = '';
-        currentAi = document.createElement('div');
-        currentAi.className = 'msg ai pending';
-        currentToolLog = document.createElement('div');
-        currentToolLog.className = 'tool-log';
-        currentAiContent = document.createElement('div');
+        const ai = createAiRow();
+        currentAi = ai.row;
+        currentAiContent = ai.content;
+        currentToolLog = ai.toolLog;
         currentAiRaw = '';
-        currentAiContent.innerText = 'Thinking...';
-        currentAi.appendChild(currentToolLog);
-        currentAi.appendChild(currentAiContent);
+        currentAiContent.innerHTML = typingHtml();
         chatBox.appendChild(currentAi);
         chatBox.scrollTop = chatBox.scrollHeight;
-        conversation.push({ role: 'user', content: fullPrompt });
+        conversation.push({ role: 'user', content: fullPrompt, display: text });
+        saveState();
         setStreaming(true);
-        vscode.postMessage({ type: 'sendPrompt', value: conversation });
+        vscode.postMessage({ type: 'sendPrompt', value: conversation.map(m => ({ role: m.role, content: m.content })) });
     });
 
     promptInput.addEventListener('keydown', (e) => {
@@ -203,9 +319,10 @@
         attachments = [];
         currentAi = null;
         currentAiRaw = '';
-        chatBox.innerHTML = '';
         promptInput.value = '';
+        renderConversation();
         renderAttachments();
+        saveState();
     });
 
     document.getElementById('grab-btn').addEventListener('click', () => {
@@ -263,17 +380,22 @@
             currentAi.classList.remove('pending');
             const note = document.createElement('div');
             note.className = 'tool-note';
-            note.textContent = '\uD83D\uDD27 ' + msg.name + '(' + (msg.args || '') + ')';
+            note.innerHTML = '<i class="codicon codicon-tools"></i>';
+            const label = document.createElement('span');
+            label.textContent = msg.name + '(' + (msg.args || '') + ')';
+            note.appendChild(label);
             currentToolLog.appendChild(note);
             chatBox.scrollTop = chatBox.scrollHeight;
         } else if (msg.type === 'attach') {
             attachments.push({ label: msg.label, fileName: msg.fileName, value: msg.value });
             renderAttachments();
+            saveState();
         } else if (msg.type === 'error') {
             if (currentAi) currentAi.classList.remove('pending');
             if (currentAiContent) currentAiContent.innerText = 'Error: ' + msg.value;
             conversation.pop();
             setStreaming(false);
+            saveState();
         } else if (msg.type === 'streamError') {
             // Mid-stream drop: keep whatever streamed so far and show a failed indicator.
             if (currentAi) {
@@ -282,38 +404,28 @@
                     currentAiContent.innerHTML = renderMarkdown(currentAiRaw);
                     conversation.push({ role: 'assistant', content: currentAiRaw });
                 } else {
+                    if (currentAiContent) currentAiContent.innerHTML = '';
                     conversation.pop();
                 }
                 const note = document.createElement('div');
                 note.className = 'stream-status failed';
-                note.textContent = '\u26A0 ' + (msg.value || 'Connection lost before the response finished.');
-                currentAi.appendChild(note);
+                note.innerHTML = '<i class="codicon codicon-warning"></i>';
+                const span = document.createElement('span');
+                span.textContent = msg.value || 'Connection lost before the response finished.';
+                note.appendChild(span);
+                (currentAi.querySelector('.msg-body') || currentAi).appendChild(note);
             }
             setStreaming(false);
+            saveState();
         } else if (msg.type === 'done') {
             setStreaming(false);
             if (currentAi && currentAiRaw) {
                 conversation.push({ role: 'assistant', content: currentAiRaw });
-                const footer = document.createElement('div');
-                footer.className = 'code-actions';
-                footer.style.marginTop = '6px';
-                const codeBlocks = getCodeBlocks(currentAiRaw);
-                if (codeBlocks.length === 1) {
-                    const applyAllBtn = document.createElement('button');
-                    applyAllBtn.textContent = '\uD83D\uDCDD Apply Code Block to Editor';
-                    applyAllBtn.addEventListener('click', () => {
-                        vscode.postMessage({ type: 'applyCode', value: codeBlocks[0] });
-                    });
-                    footer.appendChild(applyAllBtn);
-                }
-                const copyAllBtn = document.createElement('button');
-                copyAllBtn.textContent = '\uD83D\uDCCB Copy Full Response';
-                copyAllBtn.addEventListener('click', () => {
-                    navigator.clipboard.writeText(currentAiRaw);
-                });
-                footer.appendChild(copyAllBtn);
-                currentAi.appendChild(footer);
+                (currentAi.querySelector('.msg-body') || currentAi).appendChild(buildAssistantFooter(currentAiRaw));
+            } else if (currentAi && !currentAiRaw && currentAiContent) {
+                currentAiContent.innerHTML = '';
             }
+            saveState();
         } else if (msg.type === 'models') {
             if (typeof msg.serverUrl === 'string' && document.activeElement !== serverUrlInput) {
                 serverUrlInput.value = msg.serverUrl;
@@ -332,16 +444,27 @@
             });
             if (msg.error) {
                 settingsStatus.className = 'settings-status error';
-                settingsStatus.textContent = '\u26A0 ' + msg.error;
+                settingsStatus.innerHTML = '<i class="codicon codicon-warning"></i>';
+                const s = document.createElement('span');
+                s.textContent = msg.error;
+                settingsStatus.appendChild(s);
             } else {
                 settingsStatus.className = 'settings-status';
-                settingsStatus.textContent = models.length
+                settingsStatus.innerHTML = '<i class="codicon codicon-check"></i>';
+                const s = document.createElement('span');
+                s.textContent = models.length
                     ? models.length + ' model' + (models.length === 1 ? '' : 's') + ' available'
                     : 'No models found on the server.';
+                settingsStatus.appendChild(s);
             }
         }
     });
 
-    // Populate the server URL + model list on load.
+    // Restore any persisted thread (or show the welcome state), then load models.
+    const savedState = vscode.getState();
+    conversation = savedState && Array.isArray(savedState.conversation) ? savedState.conversation : [];
+    attachments = savedState && Array.isArray(savedState.attachments) ? savedState.attachments : [];
+    renderConversation();
+    renderAttachments();
     vscode.postMessage({ type: 'getModels' });
 })();

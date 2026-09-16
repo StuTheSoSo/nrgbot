@@ -50,9 +50,13 @@ Remote Ollama over LAN will drop connections.
 ## Priority 2 — Daily-use ergonomics
 
 ### 2.1 Conversation persistence
-- [ ] Persist the active conversation via VS Code `Memento` / webview `getState` so a
-      window reload does not wipe the thread.
-- [ ] Consider lightweight session history (list of past chats).
+- [x] Persist the active conversation via VS Code `Memento` / webview `getState` so a
+      window reload does not wipe the thread. The webview now saves `conversation` +
+      `attachments` via `setState` on every mutation (send, done, stop, error, attach,
+      detach, clear) and rebuilds the chat DOM from `getState` on load. User turns store a
+      `display` field so the restored bubble shows the typed text, not the attachment blob.
+- [ ] Consider lightweight session history (list of past chats). Deferred — this is a
+      larger multi-thread feature; only the single active thread is persisted so far.
 
 ### 2.2 Model / server switching from the UI
 - [x] Add a model dropdown in the webview (config is already read in the provider).

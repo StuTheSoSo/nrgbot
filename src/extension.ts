@@ -53,7 +53,8 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         const mediaRoot = vscode.Uri.joinPath(this.extensionUri, 'media');
         webviewView.webview.options = { enableScripts: true, localResourceRoots: [mediaRoot] };
         const scriptUri = webviewView.webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'webview.js'));
-        const csp = `default-src 'none'; style-src ${webviewView.webview.cspSource} 'unsafe-inline'; script-src ${webviewView.webview.cspSource};`;
+        const codiconUri = webviewView.webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'codicon.css'));
+        const csp = `default-src 'none'; style-src ${webviewView.webview.cspSource} 'unsafe-inline'; script-src ${webviewView.webview.cspSource}; font-src ${webviewView.webview.cspSource};`;
 
         webviewView.webview.html = `
 <!DOCTYPE html>
@@ -61,81 +62,156 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
 <head>
     <meta charset="UTF-8">
     <meta http-equiv="Content-Security-Policy" content="${csp}">
+    <link href="${codiconUri}" rel="stylesheet" />
     <style>
-        /* Flexbox configuration pushes all active utility triggers to the very bottom window panel */
-        html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; background: var(--vscode-sidebar-background); }
-        body { display: flex; flex-direction: column; font-family: sans-serif; box-sizing: border-box; padding: 10px; color: var(--vscode-editor-foreground); }
-        
-        /* Chat box dynamically consumes all available top vertical screen space */
-        #chat-box { flex: 1; overflow-y: auto; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); padding: 5px; margin-bottom: 10px; }
-        
-        .msg { margin: 8px 0; padding: 6px; border-radius: 4px; }
-        .user { background: var(--vscode-button-background); color: var(--vscode-button-foreground); white-space: pre-wrap; }
-        .ai { background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--vscode-textBlockQuote-border); }
-        .ai p, .ai ul, .ai ol { margin: 0.4em 0; }
-        .ai code { font-family: var(--vscode-editor-font-family, monospace); background: var(--vscode-textCodeBlock-background); padding: 1px 4px; border-radius: 3px; }
-        .ai pre { background: var(--vscode-textCodeBlock-background); padding: 8px; border-radius: 4px; overflow-x: auto; margin: 0; }
-        .ai pre code { padding: 0; background: none; }
-        .ai h1, .ai h2, .ai h3 { margin: 0.5em 0 0.3em; }
+        :root {
+            --nrg-accent: #3fb950;
+            --nrg-accent-hover: #4fc862;
+            --nrg-accent-soft: rgba(63, 185, 80, 0.14);
+            --nrg-accent-border: rgba(63, 185, 80, 0.42);
+            --nrg-radius: 10px;
+        }
+        * { box-sizing: border-box; }
+        html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; background: var(--vscode-sideBar-background, var(--vscode-editor-background)); }
+        body { display: flex; flex-direction: column; font-family: var(--vscode-font-family, sans-serif); font-size: 13px; padding: 10px; color: var(--vscode-foreground); }
+
+        /* Header / branding */
+        .app-header { display: flex; align-items: center; gap: 8px; padding-bottom: 8px; margin-bottom: 8px; border-bottom: 1px solid var(--vscode-panel-border); }
+        .brand { display: flex; align-items: center; gap: 7px; font-weight: 600; letter-spacing: 0.2px; }
+        .brand-mark { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; background: var(--nrg-accent-soft); color: var(--nrg-accent); border: 1px solid var(--nrg-accent-border); }
+        .brand-mark .codicon { font-size: 15px; }
+        .brand-name b { color: var(--nrg-accent); }
+        .header-actions { margin-left: auto; display: flex; gap: 4px; }
+        .icon-btn { width: 28px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; color: var(--vscode-foreground); border: 1px solid transparent; border-radius: 6px; cursor: pointer; margin: 0; }
+        .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,0.15)); }
+        .icon-btn .codicon { font-size: 16px; }
+
+        /* Chat area */
+        #chat-box { flex: 1; overflow-y: auto; padding: 4px 2px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 14px; }
+        .msg { display: flex; gap: 9px; align-items: flex-start; animation: nrg-fade 0.18s ease-out; }
+        @keyframes nrg-fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+        .msg-avatar { flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; }
+        .msg-avatar .codicon { font-size: 14px; }
+        .msg.user .msg-avatar { background: var(--vscode-input-background); color: var(--vscode-foreground); border: 1px solid var(--vscode-panel-border); }
+        .msg.ai .msg-avatar { background: var(--nrg-accent-soft); color: var(--nrg-accent); border: 1px solid var(--nrg-accent-border); }
+        .msg-body { flex: 1; min-width: 0; }
+        .msg-author { font-size: 11px; font-weight: 600; opacity: 0.7; margin-bottom: 3px; letter-spacing: 0.3px; }
+        .msg.ai .msg-author { color: var(--nrg-accent); opacity: 0.9; }
+        .msg-content { border-radius: var(--nrg-radius); padding: 8px 11px; line-height: 1.5; overflow-wrap: anywhere; }
+        .msg.user .msg-content { background: var(--nrg-accent-soft); border: 1px solid var(--nrg-accent-border); white-space: pre-wrap; }
+        .msg.ai .msg-content { background: var(--vscode-textBlockQuote-background, rgba(127,127,127,0.08)); border: 1px solid var(--vscode-panel-border); }
+        .msg-content > :first-child { margin-top: 0; }
+        .msg-content > :last-child { margin-bottom: 0; }
+        .msg-content p, .msg-content ul, .msg-content ol { margin: 0.4em 0; }
+        .msg-content code { font-family: var(--vscode-editor-font-family, monospace); background: var(--vscode-textCodeBlock-background); padding: 1px 5px; border-radius: 4px; font-size: 0.92em; }
+        .msg-content h1, .msg-content h2, .msg-content h3 { margin: 0.6em 0 0.3em; line-height: 1.3; }
+
+        /* Code blocks */
+        .code-block { margin: 0.5em 0; border: 1px solid var(--vscode-panel-border); border-radius: 8px; overflow: hidden; background: var(--vscode-textCodeBlock-background); }
+        .code-head { display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: var(--vscode-editorGroupHeader-tabsBackground, rgba(127,127,127,0.12)); border-bottom: 1px solid var(--vscode-panel-border); }
+        .code-lang { font-size: 11px; text-transform: lowercase; opacity: 0.7; font-family: var(--vscode-editor-font-family, monospace); }
+        .code-head-actions { margin-left: auto; display: flex; gap: 2px; }
+        .code-head-actions .icon-btn { width: 22px; height: 22px; }
+        .code-head-actions .icon-btn .codicon { font-size: 13px; }
+        .code-block pre { margin: 0; padding: 9px 11px; overflow-x: auto; background: none; }
+        .code-block pre code { padding: 0; background: none; font-size: 0.9em; }
+
+        /* Tables */
         .md-table { border-collapse: collapse; margin: 0.5em 0; font-size: 0.9em; max-width: 100%; display: block; overflow-x: auto; }
-        .md-table th, .md-table td { border: 1px solid var(--vscode-panel-border); padding: 4px 8px; text-align: left; }
+        .md-table th, .md-table td { border: 1px solid var(--vscode-panel-border); padding: 5px 9px; text-align: left; }
         .md-table th { background: var(--vscode-textBlockQuote-background); font-weight: 600; }
-        .code-block { margin: 0.4em 0; }
-        .code-actions { display: flex; gap: 4px; margin-bottom: 2px; }
-        .code-actions button { width: auto; margin: 0; padding: 2px 8px; font-size: 0.8em; }
-        .ai.pending { opacity: 0.7; animation: nrgbot-pulse 1.2s ease-in-out infinite; }
-        @keyframes nrgbot-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
-        .tool-note { font-size: 0.8em; opacity: 0.75; font-family: var(--vscode-editor-font-family, monospace); margin: 2px 0; }
-        .stream-status.failed { margin-top: 6px; padding: 4px 6px; border-radius: 3px; font-size: 0.85em; color: var(--vscode-inputValidation-warningForeground, var(--vscode-editor-foreground)); background: var(--vscode-inputValidation-warningBackground, rgba(181, 137, 0, 0.15)); border: 1px solid var(--vscode-inputValidation-warningBorder, #b58900); }
-        
-        /* Fixed bottom tray container formatting profiles */
-        .bottom-tray { display: flex; flex-direction: column; width: 100%; }
-        textarea { width: 100%; height: 60px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); resize: none; box-sizing: border-box; }
-        button { width: 100%; margin-top: 5px; padding: 6px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; cursor: pointer; }
-        button:hover { background: var(--vscode-button-hoverBackground); }
-        #send-btn.stop-mode { background: var(--vscode-inputValidation-warningBackground, #b58900); }
-        .btn-group { display: flex; gap: 5px; margin-bottom: 5px; }
-        .top-bar { display: flex; justify-content: flex-end; gap: 5px; margin-bottom: 5px; }
-        .top-bar button { width: auto; margin: 0; padding: 2px 8px; font-size: 0.8em; }
-        .settings-panel { border: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); padding: 8px; margin-bottom: 8px; border-radius: 4px; }
-        .settings-label { display: block; font-size: 0.75em; opacity: 0.8; margin: 4px 0 2px; text-transform: uppercase; letter-spacing: 0.03em; }
-        .settings-row { display: flex; gap: 4px; align-items: center; }
-        .settings-row input, .settings-row select { flex: 1; min-width: 0; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 3px 4px; box-sizing: border-box; font-size: 0.85em; }
-        .settings-row button { width: auto; margin: 0; padding: 3px 8px; font-size: 0.85em; flex: 0 0 auto; }
-        .settings-status { font-size: 0.75em; margin-top: 5px; min-height: 1em; opacity: 0.85; }
+
+        /* Tool notes, typing, status */
+        .tool-note { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; opacity: 0.8; font-family: var(--vscode-editor-font-family, monospace); margin: 3px 0; padding: 2px 8px; background: var(--vscode-input-background); border: 1px solid var(--vscode-panel-border); border-radius: 20px; }
+        .tool-note .codicon { font-size: 12px; color: var(--nrg-accent); }
+        .typing { display: inline-flex; gap: 4px; padding: 5px 2px; align-items: center; }
+        .typing span { width: 6px; height: 6px; border-radius: 50%; background: var(--nrg-accent); animation: nrg-typing 1s infinite ease-in-out; }
+        .typing span:nth-child(2) { animation-delay: 0.15s; }
+        .typing span:nth-child(3) { animation-delay: 0.3s; }
+        @keyframes nrg-typing { 0%, 60%, 100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-4px); opacity: 1; } }
+        .stream-status.failed { display: flex; align-items: center; gap: 6px; margin-top: 8px; padding: 6px 9px; border-radius: 6px; font-size: 12px; color: var(--vscode-inputValidation-warningForeground, var(--vscode-editor-foreground)); background: var(--vscode-inputValidation-warningBackground, rgba(181,137,0,0.15)); border: 1px solid var(--vscode-inputValidation-warningBorder, #b58900); }
+        .msg-footer { display: flex; gap: 6px; margin-top: 8px; }
+
+        /* Empty / welcome state */
+        .welcome { margin: auto; text-align: center; padding: 24px 16px; }
+        .welcome-mark { width: 46px; height: 46px; border-radius: 12px; background: var(--nrg-accent-soft); color: var(--nrg-accent); border: 1px solid var(--nrg-accent-border); display: inline-flex; align-items: center; justify-content: center; margin-bottom: 12px; }
+        .welcome-mark .codicon { font-size: 26px; }
+        .welcome h2 { margin: 0 0 4px; font-size: 15px; }
+        .welcome h2 b { color: var(--nrg-accent); }
+        .welcome p { margin: 0 0 14px; font-size: 12px; opacity: 0.75; }
+        .welcome-hints { display: flex; flex-direction: column; gap: 6px; max-width: 250px; margin: 0 auto; }
+        .welcome-hint { display: flex; align-items: center; gap: 8px; text-align: left; font-size: 12px; padding: 7px 10px; border: 1px solid var(--vscode-panel-border); border-radius: 8px; background: var(--vscode-input-background); }
+        .welcome-hint .codicon { color: var(--nrg-accent); font-size: 14px; flex: 0 0 auto; }
+
+        /* Bottom tray */
+        .bottom-tray { display: flex; flex-direction: column; width: 100%; gap: 7px; }
+        #attachments { display: flex; flex-wrap: wrap; gap: 6px; }
+        #attachments:empty { display: none; }
+        .chip { display: inline-flex; align-items: center; gap: 5px; background: var(--nrg-accent-soft); color: var(--vscode-foreground); border: 1px solid var(--nrg-accent-border); padding: 3px 8px; border-radius: 20px; font-size: 11px; max-width: 100%; }
+        .chip-icon { color: var(--nrg-accent); font-size: 12px; }
+        .chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
+        .chip-close { cursor: pointer; opacity: 0.6; font-size: 13px; display: inline-flex; }
+        .chip-close:hover { opacity: 1; color: var(--vscode-inputValidation-errorForeground, #f14c4c); }
+        .tray-row { display: flex; gap: 6px; }
+        .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 10px; background: var(--vscode-button-secondaryBackground, var(--vscode-input-background)); color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); border: 1px solid var(--vscode-panel-border); border-radius: 7px; cursor: pointer; font-size: 12px; margin: 0; width: auto; }
+        .btn:hover { background: var(--vscode-button-secondaryHoverBackground, var(--vscode-toolbar-hoverBackground, rgba(127,127,127,0.15))); }
+        .btn .codicon { font-size: 14px; }
+        .btn.grow { flex: 1; }
+        textarea { width: 100%; min-height: 62px; max-height: 200px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 8px; resize: none; padding: 8px 10px; font-family: inherit; font-size: 13px; box-sizing: border-box; }
+        textarea:focus { outline: none; border-color: var(--nrg-accent); box-shadow: 0 0 0 1px var(--nrg-accent-border); }
+        .btn-primary { display: inline-flex; align-items: center; justify-content: center; gap: 7px; width: 100%; padding: 8px; background: var(--nrg-accent); color: #08260f; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 13px; margin: 0; }
+        .btn-primary:hover { background: var(--nrg-accent-hover); }
+        .btn-primary .codicon { font-size: 15px; }
+        #send-btn.stop-mode { background: var(--vscode-inputValidation-errorBackground, #5a1d1d); color: var(--vscode-inputValidation-errorForeground, #fff); }
+        #send-btn.stop-mode:hover { background: var(--vscode-inputValidation-errorBorder, #be1100); }
+
+        /* Settings panel */
+        .settings-panel { border: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); padding: 10px; margin-bottom: 10px; border-radius: 8px; }
+        .settings-label { display: block; font-size: 10px; opacity: 0.7; margin: 8px 0 3px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+        .settings-label:first-child { margin-top: 0; }
+        .settings-row { display: flex; gap: 5px; align-items: center; }
+        .settings-row input, .settings-row select { flex: 1; min-width: 0; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 6px; padding: 5px 7px; box-sizing: border-box; font-size: 12px; }
+        .settings-row input:focus, .settings-row select:focus { outline: none; border-color: var(--nrg-accent); }
+        .settings-status { font-size: 11px; margin-top: 8px; min-height: 1em; opacity: 0.85; display: flex; align-items: center; gap: 5px; }
+        .settings-status .codicon { color: var(--nrg-accent); font-size: 13px; }
         .settings-status.error { color: var(--vscode-inputValidation-warningForeground, #b58900); }
+        .settings-status.error .codicon { color: var(--vscode-inputValidation-warningForeground, #b58900); }
     </style>
 </head>
 <body>
-    <!-- The conversation thread element stays pinned natively on top -->
-    <div class="top-bar">
-        <button id="settings-btn">⚙️ Settings</button>
-        <button id="clear-btn">🗑️ New Chat</button>
+    <div class="app-header">
+        <div class="brand">
+            <span class="brand-mark"><i class="codicon codicon-zap"></i></span>
+            <span class="brand-name">NRG<b>Bot</b></span>
+        </div>
+        <div class="header-actions">
+            <button id="settings-btn" class="icon-btn" title="Settings"><i class="codicon codicon-settings-gear"></i></button>
+            <button id="clear-btn" class="icon-btn" title="New chat"><i class="codicon codicon-add"></i></button>
+        </div>
     </div>
     <div id="settings-panel" class="settings-panel" style="display:none;">
         <label class="settings-label" for="server-url">Server URL</label>
         <div class="settings-row">
             <input id="server-url" type="text" placeholder="http://localhost:11434" />
-            <button id="connect-btn" title="Connect &amp; refresh models">🔌 Connect</button>
+            <button id="connect-btn" class="btn" title="Connect &amp; refresh models"><i class="codicon codicon-plug"></i> Connect</button>
         </div>
         <label class="settings-label" for="model-select">Model</label>
         <div class="settings-row">
             <select id="model-select"></select>
-            <button id="refresh-models-btn" title="Refresh model list">↻</button>
+            <button id="refresh-models-btn" class="icon-btn" title="Refresh model list"><i class="codicon codicon-refresh"></i></button>
         </div>
         <div id="settings-status" class="settings-status"></div>
     </div>
     <div id="chat-box"></div>
 
-    <!-- All active interface controllers are grouped safely at the bottom margin layout -->
     <div class="bottom-tray">
-        <div id="attachments" class="btn-group" style="flex-wrap:wrap;"></div>
-        <div class="btn-group">
-            <button id="grab-btn" style="flex:1;">✨ Selection</button>
-            <button id="page-btn" style="flex:1;">📄 Full Page</button>
+        <div id="attachments"></div>
+        <div class="tray-row">
+            <button id="grab-btn" class="btn grow"><i class="codicon codicon-list-selection"></i> Selection</button>
+            <button id="page-btn" class="btn grow"><i class="codicon codicon-file-code"></i> Full Page</button>
         </div>
-        <textarea id="prompt" placeholder="Ask your remote Ollama..."></textarea>
-        <button id="send-btn">Send to Remote Machine</button>
+        <textarea id="prompt" placeholder="Ask NRGBot\u2026"></textarea>
+        <button id="send-btn" class="btn-primary"><i class="codicon codicon-send"></i> Send</button>
     </div>
 
     <script src="${scriptUri}"></script>
