@@ -190,15 +190,23 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         return this.projectContext;
     }
 
-    private static readonly BASE_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message may already include attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>". That attached content IS the file the user is referring to; treat it as fully available and answer from it directly. Never call read_file or list_directory for a file whose content is already attached, and never claim an attached file does not exist. Do not echo or quote the complete attached file unless the user explicitly asks for it. You have read-only tools (read_file, list_directory, search_text, list_files) that give you direct access to every file in the workspace. When a question needs file contents, sizes, line counts, or the largest files, CALL THE TOOLS to gather the facts instead of asking the user to attach files or emitting placeholder values. Use list_files (with sortBy and limit) for questions about file sizes, line counts, or largest files. Never guess or fabricate file data. Never write JSON tool calls in your response. Only call tools supplied in this request; never invent a tool such as analyze_code_quality. Analyze attached code directly in your normal response. After a tool returns its result, write your final answer as plain English markdown prose. Never output JSON, JSON-RPC, an "error"/"result"/"jsonrpc" object, or any protocol message as your answer; the tool result is the real file content, so use it to answer the question.';
+    private static readonly BASE_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message may already include attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>". That attached content IS the file the user is referring to; treat it as fully available and answer from it directly. Never call read_file or list_directory for a file whose content is already attached, and never claim an attached file does not exist. Do not echo or quote the complete attached file unless the user explicitly asks for it. You have read-only tools (read_file, list_directory, search_text, list_files) that give you direct access to every file in the workspace. When a question needs file contents, sizes, line counts, or the largest files, CALL THE TOOLS to gather the facts instead of asking the user to attach files or emitting placeholder values. Use list_files (with sortBy and limit) for questions about file sizes, line counts, or largest files. Never guess or fabricate file data. Never write JSON tool calls in your response. Only call tools supplied in this request; never invent a tool such as analyze_code_quality. Analyze attached code directly in your normal response. After a tool returns its result, write your final answer as plain English markdown prose. Never output JSON, JSON-RPC, an "error"/"result"/"jsonrpc" object, or any protocol message as your answer; the tool result is the real file content, so use it to answer the question. When the user asks about the project, solution, or architecture, base your answer ONLY on the "## Project knowledge" and "## Solution map" sections below. Do not invent project names, and never claim the solution uses a framework, engine, or technology (such as Unity, React, or a game engine) unless it appears in those sections. If that context does not cover the question, say what you can from it and that you do not have more detail rather than guessing.';
 
     // Used when the message already carries an attached file: no tools are offered, so the prompt
     // must not mention them or a weak model will still write a tool call as text and stall.
     private static readonly ATTACHMENT_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message includes attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>". That attached content IS the file the user is asking about and is fully available to you. Analyze it directly and answer in plain English markdown prose. You have NO tools available: do not call, request, or mention any tool (read_file, list_files, etc.), do not ask the user to run or confirm anything, and do not ask for the file or claim you lack access. Never output JSON, a tool call, an "error"/"result"/"jsonrpc" object, or any protocol message \u2014 just write your analysis. Do not echo or quote the entire file unless the user explicitly asks.';
 
-    private buildSystemPrompt(context: { knowledge: string; map: string }, hasAttachment = false): string {
-        if (hasAttachment) {
-            return OllamaViewProvider.ATTACHMENT_SYSTEM_PROMPT;
+    // Attached file PLUS a question that needs other files (usages, references, callers): tools stay on.
+    private static readonly ATTACHMENT_WITH_TOOLS_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message includes attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>"; treat that attached content as fully available. The user\'s question needs information from OTHER files in the workspace (for example, where a symbol is used or referenced). Use the read-only tools to find it: search_text to find where a name appears across the workspace, list_files to locate files, and read_file to inspect another file. Call one tool at a time and wait for its result before the next. After the tools return, write your final answer as plain English markdown prose that cites the files and lines you found. Never ask the user to attach or paste files, never say you lack workspace access, and never output JSON, a bare tool call, or any protocol message as your final answer.';
+
+    private buildSystemPrompt(
+        context: { knowledge: string; map: string },
+        opts: { hasAttachment?: boolean; offerTools?: boolean } = {}
+    ): string {
+        if (opts.hasAttachment) {
+            return opts.offerTools
+                ? OllamaViewProvider.ATTACHMENT_WITH_TOOLS_SYSTEM_PROMPT
+                : OllamaViewProvider.ATTACHMENT_SYSTEM_PROMPT;
         }
         const parts = [OllamaViewProvider.BASE_SYSTEM_PROMPT];
         if (context.knowledge) {
@@ -208,6 +216,24 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             parts.push('## Solution map\n' + context.map);
         }
         return parts.join('\n\n');
+    }
+
+    // A question about usages/references/callers needs other files, so keep tools on even with an
+    // attachment. Only the user's typed text is checked (not the pasted file body) to avoid matching
+    // words that merely appear in the attached code.
+    private _questionNeedsWorkspaceLookup(
+        messages: { role: string; content: string | null }[]
+    ): boolean {
+        const lastUser = [...messages].reverse().find(m => m.role === 'user' && typeof m.content === 'string');
+        const raw = lastUser?.content;
+        if (typeof raw !== 'string') return false;
+        const marker = raw.indexOf('Attached file:');
+        const question = marker >= 0 ? raw.slice(0, marker) : raw;
+        return /\bwhere\b[^?]*\b(used|called|referenced|defined|declared|implemented)\b/i.test(question)
+            || /\b(usages?|references?|referenced|callers?|call sites?|invoked|invocations?)\b/i.test(question)
+            || /\bwho\s+(calls|uses|references)\b/i.test(question)
+            || /\b(across|throughout|elsewhere|other files|entire\s+(project|codebase|solution|workspace|repo))\b/i.test(question)
+            || /\bfind\b[^?]*\b(project|codebase|solution|workspace|repo)\b/i.test(question);
     }
 
     public resolveWebviewView(webviewView: vscode.WebviewView) {
@@ -731,18 +757,18 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
 
             const hasAttachment = messages.some(m =>
                 m.role === 'user' && typeof m.content === 'string' && m.content.includes('Attached file:'));
+            // Attaching a file normally suppresses tools (keeps a small model focused on the paste),
+            // but cross-file questions (usages/references) still need them, so re-enable in that case.
+            const offerTools = toolsEnabled && (!hasAttachment || this._questionNeedsWorkspaceLookup(messages));
             const systemMessage = {
                 role: 'system',
-                // A pasted file is the real subject; injecting Starfish knowledge/map here just distracts a small model.
-                content: this.buildSystemPrompt(projectContext, hasAttachment)
+                content: this.buildSystemPrompt(projectContext, { hasAttachment, offerTools })
             };
             const postData = JSON.stringify({
                 model: modelName,
                 messages: [systemMessage, ...messages],
                 stream: true,
-                // With a file attached the answer is in the prompt; offering tools just tempts a small
-                // model into emitting tool-call JSON instead of evaluating the attachment.
-                ...(toolsEnabled && !hasAttachment ? { tools: TOOLS } : {})
+                ...(offerTools ? { tools: TOOLS } : {})
             });
 
             const options = {

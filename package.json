@@ -62,12 +62,12 @@
       "editor/title": [
         {
           "command": "nrgbot.applyProposedEdit",
-          "when": "nrgbot.hasPendingEdit && resourceScheme == 'nrgbot-preview'",
+          "when": "nrgbot.hasPendingEdit",
           "group": "navigation@1"
         },
         {
           "command": "nrgbot.discardProposedEdit",
-          "when": "nrgbot.hasPendingEdit && resourceScheme == 'nrgbot-preview'",
+          "when": "nrgbot.hasPendingEdit",
           "group": "navigation@2"
         }
       ]
