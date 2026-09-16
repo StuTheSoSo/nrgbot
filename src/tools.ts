@@ -127,6 +127,18 @@ async function searchTextTool(query: string, globPattern?: string): Promise<stri
     return matches.length ? truncate(matches.join('\n')) : 'No matches found.';
 }
 
+const TOOL_NAMES = new Set(TOOLS.map(t => t.function.name));
+
+/** True when the model requested a tool this extension actually exposes. */
+export function isKnownTool(name: string): boolean {
+    return TOOL_NAMES.has(name);
+}
+
+/** Corrective result fed back to a model that invented or misnamed a tool. */
+export function unknownToolResult(name: string): string {
+    return `The ${name} tool is unavailable. Do not invent tools. Answer the user's request directly using any attached file content.`;
+}
+
 export async function executeTool(name: string, args: Record<string, unknown>): Promise<string> {
     try {
         switch (name) {
@@ -137,7 +149,7 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
             case 'search_text':
                 return await searchTextTool(String(args.query ?? ''), args.globPattern ? String(args.globPattern) : undefined);
             default:
-                return `Error: unknown tool "${name}"`;
+                return unknownToolResult(name);
         }
     } catch (e) {
         return `Error: ${e instanceof Error ? e.message : String(e)}`;

@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 import * as http from 'http';
 import * as https from 'https';
-import { TOOLS, executeTool } from './tools';
+import { TOOLS, executeTool, isKnownTool } from './tools';
+import { extractLeadingToolCallJson } from './parsing';
 
 export function activate(context: vscode.ExtensionContext) {
     const provider = new OllamaViewProvider(context.extensionUri);
@@ -215,13 +216,12 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             } catch {
                 // Malformed arguments JSON from the model; execute with empty args, tool reports its own error.
             }
-            const supportedTool = TOOLS.some(tool => tool.function.name === tc.name);
+            const supportedTool = isKnownTool(tc.name);
             if (supportedTool) {
                 webview.postMessage({ type: 'toolCall', name: tc.name, args: tc.arguments });
             }
-            const toolResult = supportedTool
-                ? await executeTool(tc.name, args)
-                : `The ${tc.name} tool is unavailable. Do not invent tools. Answer the user's request directly using any attached file content.`;
+            // executeTool returns the corrective message for unknown tools, so no separate branch is needed.
+            const toolResult = await executeTool(tc.name, args);
             nextMessages.push({ role: 'tool', tool_call_id: tc.id, content: toolResult });
         }
 
@@ -324,7 +324,7 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                                             webview.postMessage({ type: 'token', value: displayBuffer });
                                             displayBuffer = '';
                                         } else {
-                                            const leading = this._extractLeadingToolCallJson(displayBuffer);
+                                            const leading = extractLeadingToolCallJson(displayBuffer);
                                             if (leading) {
                                                 jsonPrefixDecided = true;
                                                 if (leading.rest) webview.postMessage({ type: 'token', value: leading.rest });
@@ -363,7 +363,7 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                     let toolCalls = [...toolCallAccum.values()].filter(tc => tc.name);
                     // Some models write a tool call as plain JSON text (sometimes followed by their real answer)
                     // instead of using the tool_calls delta, or echo the call back before/alongside their answer.
-                    const leading = this._extractLeadingToolCallJson(content);
+                    const leading = extractLeadingToolCallJson(content);
                     if (leading) {
                         if (toolCalls.length === 0 && leading.rest.trim() === '') {
                             toolCalls = [{ id: `fallback-${Date.now()}`, name: leading.name, arguments: leading.arguments }];
@@ -418,63 +418,5 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             case 'ECONNRESET': return `The connection to ${url} was reset while waiting for a response.`;
             default: return e.message;
         }
-    }
-
-    /**
-     * Looks for a tool call a model wrote as plain JSON text at the start of its content (optionally
-     * wrapped in <tool_call> tags or a ```json fence), instead of using the proper tool_calls delta.
-     * Returns the parsed call plus whatever text follows it, so leaked/echoed JSON can be stripped
-     * even when real prose follows.
-     */
-    private _extractLeadingToolCallJson(content: string): { name: string; arguments: string; rest: string } | null {
-        let rest = content.replace(/^\s+/, '');
-        const tagMatch = rest.match(/^<tool_call>\s*/i);
-        if (tagMatch) rest = rest.slice(tagMatch[0].length);
-        const fenceMatch = rest.match(/^```(?:json)?\s*/i);
-        if (fenceMatch) rest = rest.slice(fenceMatch[0].length);
-        if (!rest.startsWith('{')) return null;
-
-        let depth = 0;
-        let inString = false;
-        let escape = false;
-        let endIdx = -1;
-        for (let i = 0; i < rest.length; i++) {
-            const ch = rest[i];
-            if (inString) {
-                if (escape) escape = false;
-                else if (ch === '\\') escape = true;
-                else if (ch === '"') inString = false;
-                continue;
-            }
-            if (ch === '"') { inString = true; continue; }
-            if (ch === '{') depth++;
-            else if (ch === '}') {
-                depth--;
-                if (depth === 0) { endIdx = i; break; }
-            }
-        }
-        if (endIdx === -1) return null;
-
-        let parsed: unknown;
-        try {
-            parsed = JSON.parse(rest.slice(0, endIdx + 1));
-        } catch {
-            return null;
-        }
-
-        const name = (parsed as { name?: unknown })?.name;
-        const args = (parsed as { arguments?: unknown })?.arguments;
-    if (typeof name !== 'string') return null;
-
-        let remainder = rest.slice(endIdx + 1);
-        remainder = remainder.replace(/^\s*<\/tool_call>/i, '');
-        remainder = remainder.replace(/^\s*```/, '');
-        remainder = remainder.replace(/^\s+/, '');
-
-        return {
-            name,
-            arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}),
-            rest: remainder
-        };
     }
 }

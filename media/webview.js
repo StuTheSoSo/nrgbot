@@ -100,6 +100,7 @@
         return text;
     }
 
+    // stripFences and getCodeBlocks mirror src/parsing.ts (kept in sync manually; tested there).
     function stripFences(raw) {
         const lines = raw.trim().split('\n');
         if (!/^```[a-zA-Z0-9]*\s*$/.test(lines[0])) return raw.trim();
