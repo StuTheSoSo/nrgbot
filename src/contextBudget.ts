@@ -87,7 +87,7 @@ export function normalizeContextBudget(value: number): number {
 
 /**
  * Fit knowledge, map, and request-applicable rules into one combined character cap.
- * Space starts at 45/35/20 percent and unused capacity is redistributed by priority.
+ * Curated knowledge can borrow map capacity; applicable rules retain their allocation.
  */
 export function budgetProjectContext(
     context: ProjectContextSections,
@@ -143,6 +143,20 @@ export function budgetProjectContext(
         assigned += section.cap;
         section.result = truncateUnits(section.source, section.cap, section.unit, section.split);
     });
+
+    const knowledgeSection = sections.find(section => section.key === 'knowledge');
+    const mapSection = sections.find(section => section.key === 'map');
+    if (knowledgeSection && mapSection && knowledgeSection.source.length > knowledgeSection.cap) {
+        const transfer = Math.min(
+            knowledgeSection.source.length - knowledgeSection.cap,
+            Math.max(0, mapSection.cap - 256)
+        );
+        knowledgeSection.cap += transfer;
+        mapSection.cap -= transfer;
+        for (const section of [knowledgeSection, mapSection]) {
+            section.result = truncateUnits(section.source, section.cap, section.unit, section.split);
+        }
+    }
 
     let remaining = budget - sections.reduce((sum, section) => sum + section.result.text.length, 0);
     for (const section of sections) {

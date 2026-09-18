@@ -55,11 +55,11 @@ suite('request routing', () => {
         }), {
             offerTools: true,
             fileAction: false,
-            injectKnowledge: false
+            injectKnowledge: true
         });
     });
 
-    test('uses post-tool routing without reinjecting baseline context', () => {
+    test('retains baseline knowledge while inspecting source through tools', () => {
         assert.deepStrictEqual(route({
             hasToolResults: true,
             isFileAction: true,
@@ -67,7 +67,7 @@ suite('request routing', () => {
         }), {
             offerTools: true,
             fileAction: false,
-            injectKnowledge: false
+            injectKnowledge: true
         });
     });
 

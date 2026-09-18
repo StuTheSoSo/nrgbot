@@ -29,7 +29,11 @@ interface ProjectContext {
     rules: string;
 }
 
+let diagnostics: vscode.OutputChannel | undefined;
+
 export function activate(context: vscode.ExtensionContext) {
+    diagnostics = vscode.window.createOutputChannel('NRGBot Context');
+    context.subscriptions.push(diagnostics);
     const previewProvider = new ApplyPreviewProvider();
     const provider = new OllamaViewProvider(context.extensionUri, previewProvider);
 
@@ -283,6 +287,17 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         const rules = await readKnowledgeDoc(rulesFile, 0);
         const map = includeMap ? await generateProjectMap(0) : '';
         console.log(`[NRGBot] project context loaded: knowledge=${knowledge.length} chars from "${knowledgeFile}", map=${map.length} chars, rules=${rules.length} chars from "${rulesFile}"`);
+        diagnostics?.appendLine(JSON.stringify({
+            event: 'contextLoaded',
+            workspace: vscode.workspace.workspaceFolders?.map(folder => folder.uri.fsPath),
+            knowledgeFile,
+            knowledgeChars: knowledge.length,
+            mapChars: map.length,
+            rulesChars: rules.length
+        }));
+        if (!knowledge) {
+            diagnostics?.appendLine('WARNING: No curated knowledge loaded. The configured document is missing, empty, or unreadable.');
+        }
         this.projectContext = { knowledge, map, rules };
         return this.projectContext;
     }
@@ -815,6 +830,17 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                 temperature,
                 ...(offerTools ? { tools: TOOLS } : {})
             });
+            diagnostics?.appendLine(JSON.stringify({
+                event: 'request',
+                model: modelName,
+                hasAttachment,
+                offerTools,
+                hasToolResults,
+                injectKnowledge,
+                knowledgeChars: injectKnowledge ? requestContext.knowledge.length : 0,
+                mapChars: injectKnowledge ? requestContext.map.length : 0,
+                requestBytes: Buffer.byteLength(postData)
+            }));
 
             const options = {
                 hostname: parsedUrl.hostname,

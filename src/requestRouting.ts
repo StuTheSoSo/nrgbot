@@ -23,8 +23,7 @@ export function determineRequestRouting(input: RequestRoutingInput): RequestRout
         && input.isFileAction
         && !input.hasToolResults;
     const injectKnowledge = input.hasKnowledge
-        && !input.hasAttachment
-        && !input.hasToolResults;
+        && (!input.hasAttachment || input.attachmentNeedsWorkspaceLookup);
 
     return { offerTools, fileAction, injectKnowledge };
 }

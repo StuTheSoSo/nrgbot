@@ -93,4 +93,16 @@ suite('combined project-context budget', () => {
         const input = { knowledge: 'knowledge', map: 'map', rules: 'rules' };
         assert.deepStrictEqual(budgetProjectContext(input, 300, true), input);
     });
+
+    test('preserves a late integration workflow instead of allocating its space to generated metadata', () => {
+        const knowledge = '# Architecture\n\n' + 'Verified architecture. '.repeat(340)
+            + '\n\n## Common workflows\nAdd a new device: extend DeviceType and DeviceFactory.Create.';
+        const map = Array.from({ length: 45 }, (_, index) =>
+            `Project: Library${index}\nPath: Library${index}/Library.csproj\nTargets: net48\nReferences: Interfaces, Common`
+        ).join('\n');
+        const result = budgetProjectContext({ knowledge, map, rules: '' }, 9000, false);
+        assert.strictEqual(result.knowledge, knowledge);
+        assert.match(result.map, /Project: Library0/);
+        assert.ok(totalLength(result) <= 9000);
+    });
 });
