@@ -436,11 +436,12 @@
             saveState();
         } else if (msg.type === 'done') {
             setStreaming(false);
+            if (currentAi) currentAi.classList.remove('pending');
             if (currentAi && currentAiRaw) {
                 conversation.push({ role: 'assistant', content: currentAiRaw });
                 (currentAi.querySelector('.msg-body') || currentAi).appendChild(buildAssistantFooter(currentAiRaw));
             } else if (currentAi && !currentAiRaw && currentAiContent) {
-                currentAiContent.innerHTML = '';
+                currentAiContent.innerText = 'No response received from the model.';
             }
             saveState();
         } else if (msg.type === 'models') {

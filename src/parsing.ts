@@ -8,6 +8,20 @@ export interface LeadingToolCall {
     rest: string;
 }
 
+export interface CompleteLines {
+    lines: string[];
+    remainder: string;
+}
+
+/** Split complete newline-delimited stream records while retaining an unfinished tail. */
+export function takeCompleteLines(text: string, flush = false): CompleteLines {
+    const lines = text.split('\n');
+    if (flush) {
+        return { lines, remainder: '' };
+    }
+    return { lines: lines.slice(0, -1), remainder: lines.at(-1) ?? '' };
+}
+
 /**
  * Looks for a tool call a model wrote as plain JSON text at the start of its content (optionally
  * wrapped in <tool_call> tags or a ```json fence), instead of using the proper tool_calls delta.

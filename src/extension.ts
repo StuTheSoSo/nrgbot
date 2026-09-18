@@ -2,7 +2,17 @@ import * as vscode from 'vscode';
 import * as http from 'http';
 import * as https from 'https';
 import { TOOLS, executeTool, isKnownTool } from './tools';
-import { extractLeadingToolCallJson, findToolCallJson } from './parsing';
+import { extractLeadingToolCallJson, findToolCallJson, takeCompleteLines } from './parsing';
+import { determineRequestRouting } from './requestRouting';
+import { buildBaselineContextMessage, composeRequestMessages } from './messageComposition';
+import { budgetProjectContext, RULES_CONTEXT_PREFIX } from './contextBudget';
+import {
+    ATTACHMENT_SYSTEM_PROMPT,
+    FILE_ACTION_SYSTEM_PROMPT,
+    GROUNDING_PREAMBLE,
+    missingAccessReminder,
+    POST_TOOL_SYSTEM_PROMPT
+} from './grounding';
 import {
     DEFAULT_KNOWLEDGE_FILE,
     DEFAULT_RULES_FILE,
@@ -150,6 +160,7 @@ class ApplyPreviewProvider implements vscode.TextDocumentContentProvider {
 
 class OllamaViewProvider implements vscode.WebviewViewProvider {
     private static readonly MAX_ATTACHMENT_CHARS = 50000;
+    private static readonly CHAT_REQUEST_TIMEOUT_MS = 120000;
 
     public lastActiveEditor: vscode.TextEditor | undefined;
     private _view: vscode.WebviewView | undefined;
@@ -268,10 +279,9 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         const knowledgeFile = config.get<string>('knowledgeFile') || DEFAULT_KNOWLEDGE_FILE;
         const rulesFile = config.get<string>('refactorRulesFile') || DEFAULT_RULES_FILE;
         const includeMap = config.get<boolean>('includeProjectMap') !== false;
-        const maxChars = config.get<number>('projectContextMaxChars') ?? DEFAULT_CONTEXT_MAX_CHARS;
-        const knowledge = await readKnowledgeDoc(knowledgeFile, maxChars);
-        const rules = await readKnowledgeDoc(rulesFile, maxChars);
-        const map = includeMap ? await generateProjectMap(maxChars) : '';
+        const knowledge = await readKnowledgeDoc(knowledgeFile, 0);
+        const rules = await readKnowledgeDoc(rulesFile, 0);
+        const map = includeMap ? await generateProjectMap(0) : '';
         console.log(`[NRGBot] project context loaded: knowledge=${knowledge.length} chars from "${knowledgeFile}", map=${map.length} chars, rules=${rules.length} chars from "${rulesFile}"`);
         this.projectContext = { knowledge, map, rules };
         return this.projectContext;
@@ -279,25 +289,13 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
 
     private static readonly BASE_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message may already include attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>". That attached content IS the file the user is referring to; treat it as fully available and answer from it directly. Never call read_file or list_directory for a file whose content is already attached, and never claim an attached file does not exist. Do not echo or quote the complete attached file unless the user explicitly asks for it. You have read-only tools (read_file, list_directory, search_text, list_files) that give you direct access to every file in the workspace. When a question needs file contents, sizes, line counts, or the largest files, CALL THE TOOLS to gather the facts instead of asking the user to attach files or emitting placeholder values. Use list_files (with sortBy and limit) for questions about file sizes, line counts, or largest files. Never guess or fabricate file data. Never write JSON tool calls in your response. Only call tools supplied in this request; never invent a tool such as analyze_code_quality. Analyze attached code directly in your normal response. After a tool returns its result, write your final answer as plain English markdown prose. Never output JSON, JSON-RPC, an "error"/"result"/"jsonrpc" object, or any protocol message as your answer; the tool result is the real file content, so use it to answer the question.';
 
-    // Leads the prompt for plain project questions so the model anchors on the real codebase before
-    // wading through tool mechanics; directly counters the "Starfish is a metaphor/joke" failure.
-    private static readonly GROUNDING_PREAMBLE = 'You are NRGBot, the coding assistant for the "Starfish" solution \u2014 the actual software codebase open in this VS Code workspace. "Starfish", "the Starfish solution", "the solution", "this project", and "the codebase" ALL refer to that codebase. The "## Project knowledge" and "## Solution map" sections below are the authoritative, factual description of it; treat everything in them as true. When the user asks about the project, solution, or architecture, answer ONLY from those sections. Never describe "Starfish" as a metaphor, idiom, joke, methodology, or generic problem-solving concept \u2014 it is a real .NET/C++ radio-gateway product. Do not invent project names, and never claim it uses a framework, engine, or technology (such as Unity, React, or a game engine) that is not named in those sections. If the sections do not cover the question, answer with what they do say and note you lack further detail rather than guessing.';
-
-    // Used when the message already carries an attached file: no tools are offered, so the prompt
-    // must not mention them or a weak model will still write a tool call as text and stall.
-    private static readonly ATTACHMENT_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message includes attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>". That attached content IS the file the user is asking about and is fully available to you. Analyze it directly and answer in plain English markdown prose. When the user asks you to refactor, rewrite, clean up, improve, document, or otherwise change the attached code, DO IT and return the improved code in a fenced code block \u2014 this is a normal, allowed request about the user\'s own workspace code, so never refuse it or reply that you can\'t assist. You have NO tools available: do not call, request, or mention any tool (read_file, list_files, etc.), do not ask the user to run or confirm anything, and do not ask for the file or claim you lack access. Never output JSON, a tool call, an "error"/"result"/"jsonrpc" object, or any protocol message \u2014 just write your analysis. Do not echo or quote the entire file unless the user explicitly asks.';
-
     // Attached file PLUS a question that needs other files (usages, references, callers): tools stay on.
     private static readonly ATTACHMENT_WITH_TOOLS_SYSTEM_PROMPT = 'You are a coding assistant inside VS Code. The user\'s message includes attached file content in fenced code blocks, each preceded by a line like "Attached file: <name>"; treat that attached content as fully available. The user\'s question needs information from OTHER files in the workspace (for example, where a symbol is used or referenced). Use the read-only tools to find it: search_text to find where a name appears across the workspace, list_files to locate files, and read_file to inspect another file. Call one tool at a time and wait for its result before the next. After the tools return, write your final answer as plain English markdown prose that cites the files and lines you found. Never ask the user to attach or paste files, never say you lack workspace access, and never output JSON, a bare tool call, or any protocol message as your final answer.';
 
     // The user asked to examine/read real files. A big grounding prompt suppresses tool-calling in a
     // 14b model, so this lean, tool-forward prompt is used instead to force an actual tool call.
-    private static readonly FILE_ACTION_SYSTEM_PROMPT = 'You are NRGBot, the coding assistant for the "Starfish" .NET/C++ radio-gateway solution open in this VS Code workspace. You have DIRECT read-only access to every file in the workspace through tools: list_files (use sortBy and limit for file sizes, line counts, or the largest files), list_directory, read_file, and search_text. The user wants you to look at real files, so you MUST call the appropriate tool now and base your answer on the result. Call the tool immediately without narrating it in prose. Call one tool at a time and wait for its result before the next. NEVER say you cannot access, browse, open, list, or interact with files, never claim to be "just a text-based model", and never ask the user to attach or paste files \u2014 read them yourself. After the tools return, write your answer as plain English markdown prose. Never output JSON, a bare tool call, or any protocol message as your final answer.';
-
     // Once tool results are in the conversation the model must stop calling tools and answer ONCE;
     // re-sending the tool-forward prompt here is what made it call again / answer twice.
-    private static readonly POST_TOOL_SYSTEM_PROMPT = 'You are NRGBot, the coding assistant for the "Starfish" .NET/C++ radio-gateway solution. You have already called one or more tools and their results appear in this conversation as tool messages. Write a SINGLE final answer to the user\'s question in plain English markdown prose, using those results. Do NOT call the same tool again, do NOT repeat or restate your answer, and do NOT output JSON or any tool-call text. Only call another tool if it is genuinely required to finish answering, and then give one final answer.';
-
     private buildSystemPrompt(
         context: ProjectContext,
         opts: { hasAttachment?: boolean; offerTools?: boolean; fileAction?: boolean; hasToolResults?: boolean } = {}
@@ -305,22 +303,22 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         if (opts.hasAttachment) {
             const base = opts.offerTools
                 ? OllamaViewProvider.ATTACHMENT_WITH_TOOLS_SYSTEM_PROMPT
-                : OllamaViewProvider.ATTACHMENT_SYSTEM_PROMPT;
+                : ATTACHMENT_SYSTEM_PROMPT;
             return this._appendRules(base, context.rules);
         }
         // Tool results already gathered: instruct a single final answer so the model stops re-calling.
         if (opts.hasToolResults) {
-            return OllamaViewProvider.POST_TOOL_SYSTEM_PROMPT;
+            return POST_TOOL_SYSTEM_PROMPT;
         }
         // An explicit "look at the files" request needs a lean prompt so tool-calling isn't drowned.
         if (opts.fileAction) {
-            return OllamaViewProvider.FILE_ACTION_SYSTEM_PROMPT;
+            return FILE_ACTION_SYSTEM_PROMPT;
         }
-        // Knowledge/map are delivered as recent conversation turns (see _buildKnowledgeTurns), which a
+        // Knowledge/map are delivered near the current question (see buildBaselineContextMessage), which a
         // small model attends to far better than a long system prompt, so the system message stays lean.
         const parts: string[] = [];
         if (context.knowledge || context.map) {
-            parts.push(OllamaViewProvider.GROUNDING_PREAMBLE);
+            parts.push(GROUNDING_PREAMBLE);
         }
         parts.push(OllamaViewProvider.BASE_SYSTEM_PROMPT);
         return parts.join('\n\n');
@@ -329,26 +327,7 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
     // Append the workspace refactoring rules so every attached-file coding request must follow them.
     private _appendRules(prompt: string, rules: string): string {
         if (!rules) return prompt;
-        return `${prompt}\n\nWhen you write or change any code, you MUST follow these project refactoring rules:\n\n${rules}`;
-    }
-
-    // Deliver the project knowledge as a recent user/assistant exchange rather than burying it in a
-    // 16KB system prompt; a small model attends to recent turns far more reliably than a long system block.
-    private _buildKnowledgeTurns(context: { knowledge: string; map: string }): { role: string; content: string }[] {
-        const ref: string[] = [];
-        if (context.knowledge) {
-            ref.push('## Project knowledge\n' + context.knowledge);
-        }
-        if (context.map) {
-            ref.push('## Solution map\n' + context.map);
-        }
-        if (ref.length === 0) {
-            return [];
-        }
-        return [
-            { role: 'user', content: 'Here is the authoritative reference for the "Starfish" solution \u2014 the actual codebase open in this workspace. Use ONLY this reference to answer questions about the project, its architecture, and its files:\n\n' + ref.join('\n\n') },
-            { role: 'assistant', content: 'Understood \u2014 Starfish is this workspace\'s .NET/C++ radio-gateway solution. I will answer from that reference and will not invent names or technologies that are not in it.' }
-        ];
+        return `${prompt}${RULES_CONTEXT_PREFIX}${rules}`;
     }
 
     // A question about usages/references/callers needs other files, so keep tools on even with an
@@ -670,9 +649,30 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
         if (!result) return; // error or abort already reported
 
         if (result.toolCalls.length === 0) {
-            if (toolsEnabled && !retried && this._looksLikeMissingFileAccess(result.content)) {
+            if (!result.content.trim()) {
+                if (!retried) {
+                    webview.postMessage({ type: 'retry' });
+                    const reminder = 'Your previous response was empty. Answer the original user request now in plain English markdown. Use the attached file content already present in the conversation, and call a supplied read-only tool only if additional workspace evidence is required.';
+                    const nudged = [
+                        ...messages,
+                        { role: 'assistant', content: null },
+                        { role: 'user', content: reminder }
+                    ];
+                    await this._streamFromOllama(nudged, webview, depth + 1, true, seenToolCalls);
+                    return;
+                }
+                webview.postMessage({
+                    type: 'error',
+                    value: 'The model returned an empty response twice. Try again or select another model.'
+                });
+                return;
+            }
+            if (!retried && this._looksLikeMissingFileAccess(result.content)) {
                 webview.postMessage({ type: 'retry' });
-                const reminder = 'You answered without calling any tool. You have direct read-only access to the workspace: use list_files (with sortBy and limit) for file sizes, line counts, or the largest files, and read_file to inspect a file. Call the appropriate tool now and answer from the real results. Do not ask the user to attach files, and never use hypothetical or placeholder values.';
+                const lastUser = [...messages].reverse().find(message => message.role === 'user');
+                const hasAttachment = typeof lastUser?.content === 'string'
+                    && lastUser.content.includes('Attached file:');
+                const reminder = missingAccessReminder(hasAttachment);
                 const nudged = [
                     ...messages,
                     { role: 'assistant', content: result.content || null },
@@ -784,38 +784,33 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             // after the user removed the chip.
             const lastUser = [...messages].reverse().find(m => m.role === 'user' && typeof m.content === 'string');
             const hasAttachment = typeof lastUser?.content === 'string' && lastUser.content.includes('Attached file:');
-            // Tool availability is deliberately narrow so the model answers grounded project questions
-            // from the knowledge doc instead of tool-calling into an unrelated file ramble. Tools are
-            // offered only when: an attachment asks a cross-file question; the user explicitly asks to
-            // inspect files; or there is no project knowledge to answer from.
             const isFileAction = this._questionIsFileAction(messages);
-            const hasKnowledge = !!(projectContext.knowledge || projectContext.map);
-            let offerTools: boolean;
-            if (hasAttachment) {
-                offerTools = toolsEnabled && this._questionNeedsWorkspaceLookup(messages);
-            } else if (isFileAction) {
-                offerTools = toolsEnabled;
-            } else {
-                offerTools = toolsEnabled && !hasKnowledge;
-            }
-            // A file-action request with tools on gets the lean tool-forward prompt so the large
-            // grounding context doesn't suppress the model's tool call.
-            const fileAction = offerTools && !hasAttachment && isFileAction;
+            const maxContextChars = config.get<number>('projectContextMaxChars') ?? DEFAULT_CONTEXT_MAX_CHARS;
+            const requestContext = budgetProjectContext(projectContext, maxContextChars, hasAttachment);
+            const hasKnowledge = !!(requestContext.knowledge || requestContext.map);
             // After a tool has run, its result is in the conversation; switch to the answer-once prompt.
             const hasToolResults = messages.some(m => m.role === 'tool');
-            const injectKnowledge = !hasAttachment && !fileAction && !hasToolResults && hasKnowledge;
+            const { offerTools, fileAction, injectKnowledge } = determineRequestRouting({
+                toolsEnabled,
+                hasAttachment,
+                attachmentNeedsWorkspaceLookup: hasAttachment && this._questionNeedsWorkspaceLookup(messages),
+                isFileAction,
+                hasToolResults,
+                hasKnowledge
+            });
             const systemMessage = {
                 role: 'system',
-                content: this.buildSystemPrompt(projectContext, { hasAttachment, offerTools, fileAction, hasToolResults })
+                content: this.buildSystemPrompt(requestContext, { hasAttachment, offerTools, fileAction, hasToolResults })
             };
-            // Knowledge is delivered as recent turns (not the system prompt) so a small model actually uses it.
-            const contextTurns = injectKnowledge ? this._buildKnowledgeTurns(projectContext) : [];
+            const contextMessage = injectKnowledge
+                ? buildBaselineContextMessage(requestContext)
+                : undefined;
             // Ollama defaults to 0.8, which makes a small model ramble and drift off the grounded
             // context; a low temperature keeps answers factual and repeatable.
             const temperature = config.get<number>('temperature') ?? 0.2;
             const postData = JSON.stringify({
                 model: modelName,
-                messages: [systemMessage, ...contextTurns, ...messages],
+                messages: composeRequestMessages(systemMessage, messages, contextMessage),
                 stream: true,
                 temperature,
                 ...(offerTools ? { tools: TOOLS } : {})
@@ -859,65 +854,74 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
                 let displayBuffer = '';
                 let jsonPrefixDecided = false;
                 const MAX_JSON_PROBE_CHARS = 4000;
-                res.on('data', (chunk) => {
-                    buffer += chunk.toString();
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop() || '';
-                    for (const line of lines) {
-                        if (line.trim().startsWith('data: ')) {
-                            const payload = line.trim().substring(6);
-                            if (payload === '[DONE]') continue;
-                            try {
-                                const json = JSON.parse(payload);
-                                const delta = json.choices?.[0]?.delta;
-                                if (delta?.content) {
-                                    content += delta.content;
-                                    if (jsonPrefixDecided) {
-                                        webview.postMessage({ type: 'token', value: delta.content });
-                                    } else {
-                                        displayBuffer += delta.content;
-                                        const probe = displayBuffer.replace(/^\s+/, '');
-                                        const looksLikeToolCallStart = probe.length === 0
-                                            || probe.startsWith('{')
-                                            || '<tool_call>'.startsWith(probe.slice(0, 11))
-                                            || '```json'.startsWith(probe.slice(0, 7))
-                                            || probe === '`' || probe === '``';
-                                        if (!looksLikeToolCallStart) {
-                                            jsonPrefixDecided = true;
-                                            webview.postMessage({ type: 'token', value: displayBuffer });
-                                            displayBuffer = '';
-                                        } else {
-                                            const leading = extractLeadingToolCallJson(displayBuffer);
-                                            if (leading) {
-                                                jsonPrefixDecided = true;
-                                                if (leading.rest) webview.postMessage({ type: 'token', value: leading.rest });
-                                                displayBuffer = '';
-                                            } else if (displayBuffer.length > MAX_JSON_PROBE_CHARS) {
-                                                // Gave up waiting for a closing brace; show it rather than hide real content forever.
-                                                jsonPrefixDecided = true;
-                                                webview.postMessage({ type: 'token', value: displayBuffer });
-                                                displayBuffer = '';
-                                            }
-                                        }
+                const processSseLine = (line: string) => {
+                    if (!line.trim().startsWith('data: ')) {
+                        return;
+                    }
+                    const payload = line.trim().substring(6);
+                    if (payload === '[DONE]') {
+                        return;
+                    }
+                    try {
+                        const json = JSON.parse(payload);
+                        const delta = json.choices?.[0]?.delta;
+                        if (delta?.content) {
+                            content += delta.content;
+                            if (jsonPrefixDecided) {
+                                webview.postMessage({ type: 'token', value: delta.content });
+                            } else {
+                                displayBuffer += delta.content;
+                                const probe = displayBuffer.replace(/^\s+/, '');
+                                const looksLikeToolCallStart = probe.length === 0
+                                    || probe.startsWith('{')
+                                    || '<tool_call>'.startsWith(probe.slice(0, 11))
+                                    || '```json'.startsWith(probe.slice(0, 7))
+                                    || probe === '`' || probe === '``';
+                                if (!looksLikeToolCallStart) {
+                                    jsonPrefixDecided = true;
+                                    webview.postMessage({ type: 'token', value: displayBuffer });
+                                    displayBuffer = '';
+                                } else {
+                                    const leading = extractLeadingToolCallJson(displayBuffer);
+                                    if (leading) {
+                                        jsonPrefixDecided = true;
+                                        if (leading.rest) webview.postMessage({ type: 'token', value: leading.rest });
+                                        displayBuffer = '';
+                                    } else if (displayBuffer.length > MAX_JSON_PROBE_CHARS) {
+                                        // Gave up waiting for a closing brace; show it rather than hide real content forever.
+                                        jsonPrefixDecided = true;
+                                        webview.postMessage({ type: 'token', value: displayBuffer });
+                                        displayBuffer = '';
                                     }
                                 }
-                                if (delta?.tool_calls) {
-                                    for (const tc of delta.tool_calls) {
-                                        const idx = tc.index ?? 0;
-                                        const acc = toolCallAccum.get(idx) ?? { id: '', name: '', arguments: '' };
-                                        if (tc.id) acc.id = tc.id;
-                                        if (tc.function?.name) acc.name += tc.function.name;
-                                        if (tc.function?.arguments) acc.arguments += tc.function.arguments;
-                                        toolCallAccum.set(idx, acc);
-                                    }
-                                }
-                            } catch (e) {
-                                console.error('[NRGBot] Failed to parse SSE line:', line, e);
                             }
                         }
+                        if (delta?.tool_calls) {
+                            for (const tc of delta.tool_calls) {
+                                const idx = tc.index ?? 0;
+                                const acc = toolCallAccum.get(idx) ?? { id: '', name: '', arguments: '' };
+                                if (tc.id) acc.id = tc.id;
+                                if (tc.function?.name) acc.name += tc.function.name;
+                                if (tc.function?.arguments) acc.arguments += tc.function.arguments;
+                                toolCallAccum.set(idx, acc);
+                            }
+                        }
+                    } catch (e) {
+                        console.error('[NRGBot] Failed to parse SSE line:', line, e);
+                    }
+                };
+                res.on('data', (chunk) => {
+                    const complete = takeCompleteLines(buffer + chunk.toString());
+                    buffer = complete.remainder;
+                    for (const line of complete.lines) {
+                        processSseLine(line);
                     }
                 });
                 res.on('end', () => {
+                    for (const line of takeCompleteLines(buffer, true).lines) {
+                        processSseLine(line);
+                    }
+                    buffer = '';
                     if (!jsonPrefixDecided && displayBuffer) {
                         // Never resolved into a full tool-call JSON blob (e.g. truncated); show it rather than dropping it.
                         webview.postMessage({ type: 'token', value: displayBuffer });
@@ -986,6 +990,9 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             });
 
             req.on('error', (e) => {
+                if (settled) {
+                    return;
+                }
                 if (this.streamAborted) {
                     finish(null);
                     return;
@@ -1000,6 +1007,15 @@ class OllamaViewProvider implements vscode.WebviewViewProvider {
             });
 
             this.activeRequest = req;
+            req.setTimeout(OllamaViewProvider.CHAT_REQUEST_TIMEOUT_MS, () => {
+                if (settled) {
+                    return;
+                }
+                const message = 'The model did not send data for 120 seconds. Try again or select another model.';
+                webview.postMessage({ type: content.length > 0 ? 'streamError' : 'error', value: message });
+                finish(null);
+                req.destroy();
+            });
             req.write(postData);
             req.end();
         });

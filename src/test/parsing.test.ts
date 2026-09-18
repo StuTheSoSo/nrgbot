@@ -1,5 +1,21 @@
 import * as assert from 'assert';
-import { extractLeadingToolCallJson, findToolCallJson, stripFences, getCodeBlocks } from '../parsing';
+import { extractLeadingToolCallJson, findToolCallJson, stripFences, getCodeBlocks, takeCompleteLines } from '../parsing';
+
+suite('parsing: newline-delimited streams', () => {
+    test('retains an incomplete final record between chunks', () => {
+        assert.deepStrictEqual(takeCompleteLines('data: one\ndata: tw'), {
+            lines: ['data: one'],
+            remainder: 'data: tw'
+        });
+    });
+
+    test('flushes a final record without a trailing newline', () => {
+        assert.deepStrictEqual(takeCompleteLines('data: final', true), {
+            lines: ['data: final'],
+            remainder: ''
+        });
+    });
+});
 
 suite('parsing: extractLeadingToolCallJson', () => {
     test('bare JSON tool call followed by prose', () => {

@@ -151,12 +151,13 @@
         "nrgbot.includeProjectMap": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically inject a compact map of the open solution (.sln projects, languages, target frameworks) into the model's system prompt."
+          "description": "Automatically inject a compact map of solution projects, languages, targets, dependencies, packages, and probable entry points."
         },
         "nrgbot.projectContextMaxChars": {
           "type": "number",
           "default": 9000,
-          "description": "Maximum characters of injected project context (knowledge doc and solution map each capped to this) to protect the model's context window."
+          "minimum": 0,
+          "description": "Maximum combined characters of injected knowledge, solution map, and applicable refactoring rules. Set to 0 to disable project context."
         },
         "nrgbot.temperature": {
           "type": "number",
